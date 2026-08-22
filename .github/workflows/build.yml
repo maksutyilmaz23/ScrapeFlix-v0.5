@@ -42,11 +42,14 @@ jobs:
           git config user.name "github-actions"
           git config user.email "actions@github.com"
           cp /tmp/outputs_listing.txt /tmp/outputs_listing.bak 2>/dev/null || echo "no outputs" > /tmp/outputs_listing.bak
+          cp /tmp/build.log /tmp/build.log.bak 2>/dev/null || echo "no build log" > /tmp/build.log.bak
           git checkout --orphan build-logs-2 || git checkout build-logs-2
           git rm -rf . || true
           mkdir -p logs
           cp /tmp/outputs_listing.bak logs/outputs_listing.txt
-          git add logs/outputs_listing.txt
+          cp /tmp/build.log.bak logs/build.log
+          tail -c 30000 logs/build.log > logs/build_tail.txt
+          git add logs/outputs_listing.txt logs/build.log logs/build_tail.txt
           git commit -m "Debug listing $(date)" || true
           git push -f origin build-logs-2 || true
           git checkout main
