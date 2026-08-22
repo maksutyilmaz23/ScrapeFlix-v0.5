@@ -201,7 +201,7 @@ private fun resolveStreamUrl(pageUrl: String): String? {
     } catch (e: Exception) { null }
 }
 
-
+class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
     val sites = db.siteDao().observeSites().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
     val allItems = db.itemDao().observeAll().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
     var selectedSiteId by mutableStateOf<Long?>(null); private set
