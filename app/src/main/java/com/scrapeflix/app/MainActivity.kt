@@ -4,6 +4,12 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.clickable
@@ -36,7 +42,9 @@ import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlin.coroutines.resume
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
@@ -77,19 +85,23 @@ private fun Element.bestImage(): String? {
     val bgHost = if (attr("style").contains("background-image")) this else selectFirst("[style*=background-image]")
     bgHost?.let { el ->
         bgRegex.find(el.attr("style"))?.groupValues?.get(1)?.let { raw ->
-            if (raw.isNotBlank()) return el.resolveUrl(raw)
+            if (raw.isNotBlank() && !raw.startsWith("data:")) return el.resolveUrl(raw)
         }
     }
-    // 2) plain <img> with common lazy-load attributes
+    // 2) plain <img> — lazy-load attribute'ları ÖNCE kontrol et, çünkü çoğu site "src"
+    //    alanına şeffaf bir placeholder (genelde base64 "data:" resmi) koyup gerçek
+    //    görseli data-src/data-lazy-src gibi alanlarda tutuyor.
     selectFirst("img")?.let { img ->
-        sequenceOf("src", "data-src", "data-lazy-src", "data-original")
-            .map { img.absUrl(it) }.firstOrNull { it.isNotBlank() }?.let { return it }
+        sequenceOf("data-src", "data-lazy-src", "data-original", "data-lazy", "src")
+            .map { img.absUrl(it) }
+            .firstOrNull { it.isNotBlank() && !it.startsWith("data:") }
+            ?.let { return it }
         val srcset = img.attr("srcset").ifBlank { img.attr("data-srcset") }
-        if (srcset.isNotBlank()) firstFromSrcset(srcset)?.let { return img.resolveUrl(it) }
+        if (srcset.isNotBlank()) firstFromSrcset(srcset)?.takeUnless { it.startsWith("data:") }?.let { return img.resolveUrl(it) }
     }
     // 3) <picture><source srcset=...>
     selectFirst("picture source[srcset]")?.let { src ->
-        firstFromSrcset(src.attr("srcset"))?.let { return src.resolveUrl(it) }
+        firstFromSrcset(src.attr("srcset"))?.takeUnless { it.startsWith("data:") }?.let { return src.resolveUrl(it) }
     }
     return null
 }
@@ -201,6 +213,65 @@ private fun resolveStreamUrl(pageUrl: String): String? {
     } catch (e: Exception) { null }
 }
 
+/** Bir URL'in gerçek video/akış kaynağı olma ihtimalini uzantısına göre değerlendirir. */
+private fun looksLikeStreamUrl(url: String): Boolean {
+    val clean = url.substringBefore('?').lowercase()
+    return clean.endsWith(".m3u8") || clean.endsWith(".mp4") || clean.endsWith(".mpd") ||
+        clean.endsWith(".ts") || clean.contains("/manifest") || clean.contains("playlist.m3u8")
+}
+
+/**
+ * 1DM benzeri yöntem: sayfayı gizli bir WebView'de gerçekten çalıştırıp (JavaScript dahil),
+ * yüklenmeye çalışılan tüm ağ isteklerini dinler ve video/m3u8/mpd uzantılı ilk isteği
+ * akış linki olarak yakalar. Statik HTML çekmenin (Jsoup) göremediği, JS ile enjekte edilen
+ * player kaynaklarını bulmak için kullanılır.
+ */
+private suspend fun sniffStreamUrlViaWebView(context: Context, pageUrl: String, timeoutMs: Long = 15000L): String? =
+    withContext(Dispatchers.Main) {
+        suspendCancellableCoroutine { cont ->
+            var resolved = false
+            val handler = Handler(Looper.getMainLooper())
+            val webView = WebView(context.applicationContext)
+
+            fun finish(url: String?) {
+                handler.post {
+                    if (resolved) return@post
+                    resolved = true
+                    handler.removeCallbacksAndMessages(null)
+                    try { webView.stopLoading(); webView.destroy() } catch (e: Exception) { /* yok say */ }
+                    if (cont.isActive) cont.resume(url)
+                }
+            }
+
+            try {
+                webView.settings.javaScriptEnabled = true
+                webView.settings.domStorageEnabled = true
+                webView.settings.mediaPlaybackRequiresUserGesture = false
+                webView.settings.userAgentString = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
+            } catch (e: Exception) { /* ayar hatası - yine de devam et */ }
+
+            webView.webViewClient = object : WebViewClient() {
+                override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+                    val url = request.url.toString()
+                    if (looksLikeStreamUrl(url)) finish(url)
+                    return super.shouldInterceptRequest(view, request)
+                }
+            }
+
+            handler.postDelayed({ finish(null) }, timeoutMs)
+            cont.invokeOnCancellation {
+                handler.post { try { webView.stopLoading(); webView.destroy() } catch (e: Exception) { } }
+            }
+
+            try {
+                webView.loadUrl(pageUrl)
+            } catch (e: Exception) {
+                finish(null)
+            }
+        }
+    }
+
+
 class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
     val sites = db.siteDao().observeSites().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
     val allItems = db.itemDao().observeAll().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
@@ -298,20 +369,24 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
     fun select(site: SiteEntity) { selectedSiteId = site.id }
 
     /** İçerik kartına tıklandığında: sayfadaki gerçek akış linkini bulur ve doğrudan
-     *  o linki, cihazdaki uyumlu uygulamalar arasından seçim yaptırarak açar (tarayıcı yok). */
+     *  o linki, cihazdaki uyumlu uygulamalar arasından seçim yaptırarak açar (tarayıcı yok).
+     *  Önce hızlı statik HTML analizini dener; bulamazsa 1DM benzeri bir yöntemle,
+     *  sayfayı gizli bir WebView'de gerçekten çalıştırıp ağ isteklerini dinleyerek arar. */
     fun openStream(context: Context, item: ScrapedItemEntity) {
         if (streamBusy) return
         streamBusy = true; message = "Akış linki aranıyor: ${item.title}"
-        viewModelScope.launch(Dispatchers.IO) {
-            val streamUrl = resolveStreamUrl(item.url)
-            withContext(Dispatchers.Main) {
-                streamBusy = false
-                if (streamUrl != null) {
-                    message = ""
-                    openContent(context, streamUrl)
-                } else {
-                    message = "Akış linki bulunamadı: ${item.title}"
-                }
+        viewModelScope.launch {
+            var streamUrl = withContext(Dispatchers.IO) { resolveStreamUrl(item.url) }
+            if (streamUrl == null) {
+                message = "Sayfa canlı olarak analiz ediliyor: ${item.title}"
+                streamUrl = sniffStreamUrlViaWebView(context, item.url)
+            }
+            streamBusy = false
+            if (streamUrl != null) {
+                message = ""
+                openContent(context, streamUrl)
+            } else {
+                message = "Akış linki bulunamadı: ${item.title}"
             }
         }
     }
@@ -650,6 +725,6 @@ fun SiteEditorDialog(
 
 @Composable fun AddSiteDialog(onDismiss:()->Unit,onAdd:(String,String)->Unit){var n by remember{mutableStateOf("")};var u by remember{mutableStateOf("")};AlertDialog(onDismissRequest=onDismiss,title={Text("Yeni Site Ekle")},text={Column(verticalArrangement=Arrangement.spacedBy(10.dp)){OutlinedTextField(n,{n=it},label={Text("Site adı")});OutlinedTextField(u,{u=it},label={Text("Site adresi")})}},confirmButton={Button({onAdd(n,u)},enabled=u.isNotBlank()){Text("Kaydet")}},dismissButton={TextButton(onDismiss){Text("İptal")}})}
 
-@Composable fun SettingsScreen(){Column(Modifier.fillMaxSize().padding(20.dp)){Text("Ayarlar",fontSize=28.sp,fontWeight=FontWeight.Bold);Spacer(Modifier.height(16.dp));Text("ScrapeFlix v0.7.0",fontWeight=FontWeight.Bold);Spacer(Modifier.height(8.dp));Text("v0.7: Görsel yakalama güçlendirildi (background-image, srcset, Referer/User-Agent header desteği). İçeriğe tıklandığında artık gerçek akış linki (mp4/m3u8) otomatik bulunup tarayıcı yerine cihazdaki bir video oynatıcı seçtiriliyor. Premium uygulama logosu eklendi.",color=Color.Gray)}}
+@Composable fun SettingsScreen(){Column(Modifier.fillMaxSize().padding(20.dp)){Text("Ayarlar",fontSize=28.sp,fontWeight=FontWeight.Bold);Spacer(Modifier.height(16.dp));Text("ScrapeFlix v0.8.0",fontWeight=FontWeight.Bold);Spacer(Modifier.height(8.dp));Text("v0.8: Görsel yakalamadaki base64 placeholder hatası düzeltildi. Akış linki artık önce statik analizle, bulunamazsa gizli bir WebView'de sayfa gerçekten çalıştırılıp ağ istekleri dinlenerek (1DM tarayıcısına benzer yöntem) bulunuyor.",color=Color.Gray)}}
 
 class MainActivity:ComponentActivity(){override fun onCreate(b:Bundle?){super.onCreate(b);setContent{App()}}}
