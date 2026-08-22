@@ -25,7 +25,7 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
 
       - name: Build Debug APK
-        run: gradle assembleDebug --no-daemon
+        run: gradle assembleDebug --no-daemon --stacktrace 2>&1 | tee /tmp/build.log
 
       - name: Find APK
         id: find_apk
@@ -38,12 +38,13 @@ jobs:
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
+          cp /tmp/build.log /tmp/build.log.bak
           git checkout --orphan build-logs || git checkout build-logs
           git rm -rf . || true
           mkdir -p logs
-          find . -name "*.log" -exec cp {} logs/ \; 2>/dev/null || true
+          cp /tmp/build.log.bak logs/build.log
           echo "Build failed at $(date)" > logs/status.txt
-          git add logs/status.txt
+          git add logs/build.log logs/status.txt
           git commit -m "Build log $(date)" || true
           git push -f origin build-logs || true
 
