@@ -37,7 +37,7 @@ import org.jsoup.nodes.Element
 import java.text.SimpleDateFormat
 import java.util.*
 
-private data class ProfileSuggestion(
+data class ProfileSuggestion(
     val item: String,
     val title: String,
     val image: String,
@@ -47,7 +47,7 @@ private data class ProfileSuggestion(
     val sampleTitles: List<String>
 )
 
-private data class LivePreviewItem(
+data class LivePreviewItem(
     val title: String,
     val url: String,
     val imageUrl: String?,
@@ -161,7 +161,7 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
 
     fun select(site: SiteEntity) { selectedSiteId = site.id }
     fun addSite(name: String, url: String) = viewModelScope.launch(Dispatchers.IO) {
-        val clean = normalizeUrl(url); val id = db.siteDao().insert(SiteEntity(name.ifBlank { clean }, clean))
+        val clean = normalizeUrl(url); val id = db.siteDao().insert(SiteEntity(name = name.ifBlank { clean }, url = clean))
         withContext(Dispatchers.Main) { selectedSiteId = id; message = "Site eklendi. Analiz başlatabilirsin." }
     }
     fun deleteSite(site: SiteEntity) = viewModelScope.launch(Dispatchers.IO) {
@@ -186,7 +186,7 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
                     val title = el.guessTitle()
                     val href = link.absUrl("href")
                     if (title.length < 2 || href.isBlank()) return@forEach
-                    val cls = el.classNames.firstOrNull()?.takeIf { it.isNotBlank() }
+                    val cls = el.classNames().firstOrNull()?.takeIf { it.isNotBlank() }
                     val css = if (cls != null) ".${cls.replace(Regex("[^A-Za-z0-9_-]"), "")}" else el.tagName()
                     var score = 2
                     if (el.selectFirst("img") != null) score += 2
@@ -239,7 +239,7 @@ enum class Page { Home, Sites, Watch, Settings }
 @Composable fun App(vm:ScrapeViewModel=viewModel(factory=VmFactory(LocalContext.current))) {
     var page by remember{mutableStateOf(Page.Home)}; var add by remember{mutableStateOf(false)}; var editor by remember{mutableStateOf<SiteEntity?>(null)}; var preview by remember{mutableStateOf(false)}
     MaterialTheme(colorScheme=darkColorScheme(background=Color(0xFF080808),surface=Color(0xFF151515),primary=Color(0xFFE50914))) {
-        Scaffold(containerColor=Color(0xFF080808),topBar={TopAppBar(title={Text("SCRAPEFLIX",fontWeight=FontWeight.Bold)},colors=TopAppBarDefaults.topAppBarColors(containerColor=Color.Black,titleContentColor=Color.White),actions={IconButton({add=true}){Icon(Icons.Default.Add,"Yeni site")}})},bottomBar={NavigationBar(containerColor=Color.Black){NavigationBarItem(page==Page.Home,{page=Page.Home},icon={Icon(Icons.Default.Home,null)},label={Text("Ana")});NavigationBarItem(page==Page.Sites,{page=Page.Sites},icon={Icon(Icons.Default.Language,null)},label={Text("Siteler")});NavigationBarItem(page==Page.Watch,{page=Page.Watch},icon={Icon(Icons.Default.PlayArrow,null)},label={Text("İçerikler")});NavigationBarItem(page==Page.Settings,{page=Page.Settings},icon={Icon(Icons.Default.Settings,null)},label={Text("Ayarlar")})}}){pad->Box(Modifier.padding(pad).fillMaxSize()){when(page){Page.Home->HomeScreen(vm){page=Page.Sites};Page.Sites->SitesScreen(vm){add=true}{editor=it};Page.Watch->WatchScreen(vm);Page.Settings->SettingsScreen()}}}
+        Scaffold(containerColor=Color(0xFF080808),topBar={TopAppBar(title={Text("SCRAPEFLIX",fontWeight=FontWeight.Bold)},colors=TopAppBarDefaults.topAppBarColors(containerColor=Color.Black,titleContentColor=Color.White),actions={IconButton({add=true}){Icon(Icons.Default.Add,"Yeni site")}})},bottomBar={NavigationBar(containerColor=Color.Black){NavigationBarItem(page==Page.Home,{page=Page.Home},icon={Icon(Icons.Default.Home,null)},label={Text("Ana")});NavigationBarItem(page==Page.Sites,{page=Page.Sites},icon={Icon(Icons.Default.Language,null)},label={Text("Siteler")});NavigationBarItem(page==Page.Watch,{page=Page.Watch},icon={Icon(Icons.Default.PlayArrow,null)},label={Text("İçerikler")});NavigationBarItem(page==Page.Settings,{page=Page.Settings},icon={Icon(Icons.Default.Settings,null)},label={Text("Ayarlar")})}}){pad->Box(Modifier.padding(pad).fillMaxSize()){when(page){Page.Home->HomeScreen(vm){page=Page.Sites};Page.Sites->SitesScreen(vm, {add=true}) {editor=it};Page.Watch->WatchScreen(vm);Page.Settings->SettingsScreen()}}}
         if(add)AddSiteDialog({add=false}){n,u->vm.addSite(n,u);add=false;page=Page.Sites}
         editor?.let{
             LaunchedEffect(it.id) { vm.loadPreviewHtml(it) }
