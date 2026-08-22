@@ -30,8 +30,26 @@ jobs:
       - name: Find APK
         id: find_apk
         run: |
+          find app/build/outputs -type f > /tmp/outputs_listing.txt || true
+          cat /tmp/outputs_listing.txt
           APK_PATH=$(find app/build/outputs/apk -name "*.apk" | head -n 1)
           echo "apk_path=$APK_PATH" >> "$GITHUB_OUTPUT"
+          echo "Resolved APK_PATH=[$APK_PATH]"
+
+      - name: Push debug listing to build-logs
+        if: always()
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          cp /tmp/outputs_listing.txt /tmp/outputs_listing.bak 2>/dev/null || echo "no outputs" > /tmp/outputs_listing.bak
+          git checkout --orphan build-logs-2 || git checkout build-logs-2
+          git rm -rf . || true
+          mkdir -p logs
+          cp /tmp/outputs_listing.bak logs/outputs_listing.txt
+          git add logs/outputs_listing.txt
+          git commit -m "Debug listing $(date)" || true
+          git push -f origin build-logs-2 || true
+          git checkout main
 
       - name: Upload build logs branch on failure
         if: failure()
