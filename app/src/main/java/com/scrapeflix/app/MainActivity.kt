@@ -17,6 +17,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -59,10 +60,38 @@ data class LivePreviewItem(
     val description: String?
 )
 
+private fun Element.resolveUrl(raw: String): String {
+    val trimmed = raw.trim()
+    return try {
+        if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) trimmed
+        else java.net.URL(java.net.URL(baseUri()), trimmed).toString()
+    } catch (e: Exception) { trimmed }
+}
+
+private fun firstFromSrcset(srcset: String): String? =
+    srcset.split(",").firstOrNull()?.trim()?.split(Regex("\\s+"))?.firstOrNull()?.takeUnless { it.isBlank() }
+
 private fun Element.bestImage(): String? {
-    val img = selectFirst("img") ?: return null
-    return sequenceOf("src", "data-src", "data-lazy-src", "data-original")
-        .map { img.absUrl(it) }.firstOrNull { it.isNotBlank() }
+    // 1) inline CSS background-image (very common on card/poster grids)
+    val bgRegex = Regex("""url\(\s*['\"]?([^'\")]+)['\"]?\s*\)""")
+    val bgHost = if (attr("style").contains("background-image")) this else selectFirst("[style*=background-image]")
+    bgHost?.let { el ->
+        bgRegex.find(el.attr("style"))?.groupValues?.get(1)?.let { raw ->
+            if (raw.isNotBlank()) return el.resolveUrl(raw)
+        }
+    }
+    // 2) plain <img> with common lazy-load attributes
+    selectFirst("img")?.let { img ->
+        sequenceOf("src", "data-src", "data-lazy-src", "data-original")
+            .map { img.absUrl(it) }.firstOrNull { it.isNotBlank() }?.let { return it }
+        val srcset = img.attr("srcset").ifBlank { img.attr("data-srcset") }
+        if (srcset.isNotBlank()) firstFromSrcset(srcset)?.let { return img.resolveUrl(it) }
+    }
+    // 3) <picture><source srcset=...>
+    selectFirst("picture source[srcset]")?.let { src ->
+        firstFromSrcset(src.attr("srcset"))?.let { return src.resolveUrl(it) }
+    }
+    return null
 }
 
 private fun Element.guessTitle(): String =
@@ -136,7 +165,43 @@ private fun openContent(context: Context, url: String) {
     }
 }
 
-class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
+/** İçerik sayfasının hostuna göre Referer header'ı üretir (hotlink korumasını aşmak için). */
+private fun refererFor(url: String): String = try {
+    val u = java.net.URI(url)
+    "${u.scheme}://${u.host}/"
+} catch (e: Exception) { url }
+
+private val streamUrlRegex = Regex("""https?://[^\s"'<>\\]+\.(m3u8|mp4|mpd)(\?[^\s"'<>\\]*)?""", RegexOption.IGNORE_CASE)
+
+/** İçerik detay sayfasını analiz ederek gerçek video/akış linkini bulmaya çalışır. */
+private fun resolveStreamUrl(pageUrl: String): String? {
+    return try {
+        val doc = Jsoup.connect(pageUrl).userAgent("Mozilla/5.0 (Android) ScrapeFlix/0.7").timeout(15000).followRedirects(true).get()
+
+        doc.selectFirst("video[src]")?.absUrl("src")?.takeUnless { it.isBlank() }?.let { return it }
+        doc.selectFirst("video source[src]")?.absUrl("src")?.takeUnless { it.isBlank() }?.let { return it }
+        doc.select("meta[property=og:video], meta[property=og:video:url], meta[property=og:video:secure_url], meta[name=twitter:player:stream]")
+            .firstOrNull()?.attr("content")?.takeUnless { it.isBlank() }?.let { return it }
+
+        val html = doc.outerHtml()
+        streamUrlRegex.find(html)?.value?.let { return it }
+
+        // Bir seviye derine in: player genelde iframe içinde embed edilmiş olabilir
+        val iframeSrc = doc.selectFirst("iframe[src]")?.absUrl("src")
+        if (!iframeSrc.isNullOrBlank()) {
+            try {
+                val iframeDoc = Jsoup.connect(iframeSrc).userAgent("Mozilla/5.0 (Android) ScrapeFlix/0.7")
+                    .referrer(pageUrl).timeout(12000).followRedirects(true).get()
+                iframeDoc.selectFirst("video[src]")?.absUrl("src")?.takeUnless { it.isBlank() }?.let { return it }
+                iframeDoc.selectFirst("video source[src]")?.absUrl("src")?.takeUnless { it.isBlank() }?.let { return it }
+                streamUrlRegex.find(iframeDoc.outerHtml())?.value?.let { return it }
+            } catch (e: Exception) { /* embed alınamadı */ }
+        }
+        null
+    } catch (e: Exception) { null }
+}
+
+
     val sites = db.siteDao().observeSites().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
     val allItems = db.itemDao().observeAll().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
     var selectedSiteId by mutableStateOf<Long?>(null); private set
@@ -148,6 +213,7 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
     var previewBusy by mutableStateOf(false); private set
     var previewError by mutableStateOf(""); private set
     var livePreviewItems by mutableStateOf<List<LivePreviewItem>>(emptyList()); private set
+    var streamBusy by mutableStateOf(false); private set
     private var previewJob: kotlinx.coroutines.Job? = null
 
     fun loadPreviewHtml(site: SiteEntity) {
@@ -230,6 +296,26 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
     }
 
     fun select(site: SiteEntity) { selectedSiteId = site.id }
+
+    /** İçerik kartına tıklandığında: sayfadaki gerçek akış linkini bulur ve doğrudan
+     *  o linki, cihazdaki uyumlu uygulamalar arasından seçim yaptırarak açar (tarayıcı yok). */
+    fun openStream(context: Context, item: ScrapedItemEntity) {
+        if (streamBusy) return
+        streamBusy = true; message = "Akış linki aranıyor: ${item.title}"
+        viewModelScope.launch(Dispatchers.IO) {
+            val streamUrl = resolveStreamUrl(item.url)
+            withContext(Dispatchers.Main) {
+                streamBusy = false
+                if (streamUrl != null) {
+                    message = ""
+                    openContent(context, streamUrl)
+                } else {
+                    message = "Akış linki bulunamadı: ${item.title}"
+                }
+            }
+        }
+    }
+
     fun addSite(name: String, url: String) = viewModelScope.launch(Dispatchers.IO) {
         val clean = normalizeUrl(url); val id = db.siteDao().insert(SiteEntity(name = name.ifBlank { clean }, url = clean))
         withContext(Dispatchers.Main) { selectedSiteId = id; message = "Site eklendi. Analiz başlatabilirsin." }
@@ -337,7 +423,57 @@ enum class Page { Home, Sites, Watch, Settings }
 
 @Composable fun SiteCard(site:SiteEntity,onAnalyze:()->Unit,onScrape:()->Unit,onDelete:()->Unit){Card(Modifier.fillMaxWidth(),shape=RoundedCornerShape(14.dp),colors=CardDefaults.cardColors(containerColor=Color(0xFF191919))){Column(Modifier.padding(14.dp)){Text(site.name,fontSize=19.sp,fontWeight=FontWeight.Bold);Text(site.url,color=Color.Gray,maxLines=1);Text("${site.itemCount} içerik • ${site.profileStatus}",color=Color.LightGray,fontSize=13.sp);Row(horizontalArrangement=Arrangement.spacedBy(2.dp)){TextButton(onAnalyze){Icon(Icons.Default.Search,null);Text(" Analiz")};TextButton(onScrape){Icon(Icons.Default.Refresh,null);Text(" Tara")};TextButton(onDelete){Icon(Icons.Default.Delete,null);Text(" Sil")}}}}}
 
-@Composable fun WatchScreen(vm:ScrapeViewModel){val items by vm.allItems.collectAsState();var q by remember{mutableStateOf("")};var cat by remember{mutableStateOf("Tümü")};val filtered=items.filter{(q.isBlank()||it.title.contains(q,true))&&(cat=="Tümü"||it.category==cat)};Column(Modifier.fillMaxSize().padding(16.dp)){Text("İçerikler",fontSize=28.sp,fontWeight=FontWeight.Bold);OutlinedTextField(q,{q=it},Modifier.fillMaxWidth(),label={Text("İçerik ara")});Spacer(Modifier.height(8.dp));Row(horizontalArrangement=Arrangement.spacedBy(6.dp)){listOf("Tümü","Film","Dizi","Anime","Belgesel").forEach{FilterChip(selected=cat==it,onClick={cat=it},label={Text(it)})}};Spacer(Modifier.height(10.dp));if(filtered.isEmpty())Text("Sonuç bulunamadı.",color=Color.Gray) else LazyColumn(verticalArrangement=Arrangement.spacedBy(10.dp)){items(filtered){item->val c=LocalContext.current;Card(Modifier.fillMaxWidth().clickable{openContent(c,item.url)},colors=CardDefaults.cardColors(containerColor=Color(0xFF191919))){Row(Modifier.padding(10.dp),verticalAlignment=Alignment.CenterVertically){if(!item.imageUrl.isNullOrBlank())AsyncImage(model=item.imageUrl,contentDescription=item.title,modifier=Modifier.size(90.dp,70.dp));Spacer(Modifier.width(10.dp));Column{Text(item.title,fontWeight=FontWeight.Bold,maxLines=2);Text(item.category,color=Color.Gray,fontSize=12.sp);item.description?.let{Text(it,color=Color.Gray,maxLines=2,fontSize=12.sp)}}}}}}}}
+@Composable fun WatchScreen(vm: ScrapeViewModel) {
+    val items by vm.allItems.collectAsState()
+    val context = LocalContext.current
+    var q by remember { mutableStateOf("") }
+    var cat by remember { mutableStateOf("Tümü") }
+    val filtered = items.filter { (q.isBlank() || it.title.contains(q, true)) && (cat == "Tümü" || it.category == cat) }
+    Column(Modifier.fillMaxSize().padding(16.dp)) {
+        Text("İçerikler", fontSize = 28.sp, fontWeight = FontWeight.Bold)
+        OutlinedTextField(q, { q = it }, Modifier.fillMaxWidth(), label = { Text("İçerik ara") })
+        Spacer(Modifier.height(8.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            listOf("Tümü", "Film", "Dizi", "Anime", "Belgesel").forEach {
+                FilterChip(selected = cat == it, onClick = { cat = it }, label = { Text(it) })
+            }
+        }
+        Spacer(Modifier.height(8.dp))
+        if (vm.streamBusy) LinearProgressIndicator(Modifier.fillMaxWidth())
+        if (vm.message.isNotBlank()) Text(vm.message, color = Color.LightGray, fontSize = 12.sp, modifier = Modifier.padding(vertical = 4.dp))
+        Spacer(Modifier.height(2.dp))
+        if (filtered.isEmpty()) Text("Sonuç bulunamadı.", color = Color.Gray) else LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            items(filtered) { item ->
+                Card(
+                    modifier = Modifier.fillMaxWidth().clickable { vm.openStream(context, item) },
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF191919))
+                ) {
+                    Row(Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                        if (!item.imageUrl.isNullOrBlank()) {
+                            AsyncImage(
+                                model = coil.request.ImageRequest.Builder(context)
+                                    .data(item.imageUrl)
+                                    .addHeader("User-Agent", "Mozilla/5.0 (Android) ScrapeFlix/0.7")
+                                    .addHeader("Referer", refererFor(item.url))
+                                    .crossfade(true)
+                                    .build(),
+                                contentDescription = item.title,
+                                contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+                                modifier = Modifier.size(90.dp, 70.dp).clip(RoundedCornerShape(6.dp))
+                            )
+                            Spacer(Modifier.width(10.dp))
+                        }
+                        Column {
+                            Text(item.title, fontWeight = FontWeight.Bold, maxLines = 2)
+                            Text(item.category, color = Color.Gray, fontSize = 12.sp)
+                            item.description?.let { Text(it, color = Color.Gray, maxLines = 2, fontSize = 12.sp) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 @Composable
 fun SiteEditorDialog(
@@ -463,10 +599,17 @@ fun SiteEditorDialog(
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
                                     if (!p.imageUrl.isNullOrBlank()) {
+                                        val ctx = LocalContext.current
                                         AsyncImage(
-                                            model = p.imageUrl,
+                                            model = coil.request.ImageRequest.Builder(ctx)
+                                                .data(p.imageUrl)
+                                                .addHeader("User-Agent", "Mozilla/5.0 (Android) ScrapeFlix/0.7")
+                                                .addHeader("Referer", refererFor(site.url))
+                                                .crossfade(true)
+                                                .build(),
                                             contentDescription = p.title,
-                                            modifier = Modifier.size(64.dp, 82.dp)
+                                            contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+                                            modifier = Modifier.size(64.dp, 82.dp).clip(RoundedCornerShape(6.dp))
                                         )
                                         Spacer(Modifier.width(9.dp))
                                     }
@@ -507,6 +650,6 @@ fun SiteEditorDialog(
 
 @Composable fun AddSiteDialog(onDismiss:()->Unit,onAdd:(String,String)->Unit){var n by remember{mutableStateOf("")};var u by remember{mutableStateOf("")};AlertDialog(onDismissRequest=onDismiss,title={Text("Yeni Site Ekle")},text={Column(verticalArrangement=Arrangement.spacedBy(10.dp)){OutlinedTextField(n,{n=it},label={Text("Site adı")});OutlinedTextField(u,{u=it},label={Text("Site adresi")})}},confirmButton={Button({onAdd(n,u)},enabled=u.isNotBlank()){Text("Kaydet")}},dismissButton={TextButton(onDismiss){Text("İptal")}})}
 
-@Composable fun SettingsScreen(){Column(Modifier.fillMaxSize().padding(20.dp)){Text("Ayarlar",fontSize=28.sp,fontWeight=FontWeight.Bold);Spacer(Modifier.height(16.dp));Text("ScrapeFlix v0.6.0",fontWeight=FontWeight.Bold);Spacer(Modifier.height(8.dp));Text("v0.6: Tarama artık sitenin alt menülerini de otomatik keşfedip tüm sayfaları tarıyor. İçeriğe tıklandığında tarayıcı yerine cihazdaki uygun uygulamalar arasından seçim yapılabiliyor.",color=Color.Gray)}}
+@Composable fun SettingsScreen(){Column(Modifier.fillMaxSize().padding(20.dp)){Text("Ayarlar",fontSize=28.sp,fontWeight=FontWeight.Bold);Spacer(Modifier.height(16.dp));Text("ScrapeFlix v0.7.0",fontWeight=FontWeight.Bold);Spacer(Modifier.height(8.dp));Text("v0.7: Görsel yakalama güçlendirildi (background-image, srcset, Referer/User-Agent header desteği). İçeriğe tıklandığında artık gerçek akış linki (mp4/m3u8) otomatik bulunup tarayıcı yerine cihazdaki bir video oynatıcı seçtiriliyor. Premium uygulama logosu eklendi.",color=Color.Gray)}}
 
 class MainActivity:ComponentActivity(){override fun onCreate(b:Bundle?){super.onCreate(b);setContent{App()}}}
