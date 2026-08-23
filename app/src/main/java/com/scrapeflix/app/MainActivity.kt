@@ -308,6 +308,30 @@ private suspend fun sniffStreamUrlViaWebView(context: Context, pageUrl: String, 
     }
 
 
+data class EpisodeInfo(val title: String, val url: String)
+
+/** Bir dizi/anime detay sayfasındaki bölüm linklerini bulmaya çalışır (metin veya
+ *  class/href içinde "bölüm/bolum/episode/ep" ve ardından bir sayı geçen linkler). */
+private fun extractEpisodes(doc: Document, baseUrl: String): List<EpisodeInfo> {
+    val baseHost = try { java.net.URI(baseUrl).host } catch (e: Exception) { null } ?: return emptyList()
+    val numberedWord = Regex("""(b[öo]l[üu]m|episode|epizod|ep)\D{0,3}\d{1,4}""", RegexOption.IGNORE_CASE)
+    val wordThenNumber = Regex("""\d{1,4}\D{0,3}(b[öo]l[üu]m|episode|epizod)""", RegexOption.IGNORE_CASE)
+    val hintWords = listOf("episode", "bolum", "bölüm", "epizod", "ep-", "ep_")
+
+    return doc.select("a[href]").mapNotNull { a ->
+        val href = a.absUrl("href").trim()
+        if (href.isBlank() || href.trimEnd('/') == baseUrl.trimEnd('/')) return@mapNotNull null
+        val host = try { java.net.URI(href).host } catch (e: Exception) { null }
+        if (host != baseHost) return@mapNotNull null
+        val text = a.text().trim()
+        val hay = (text + " " + a.attr("class") + " " + a.attr("href")).lowercase(Locale.getDefault())
+        val looksEpisode = numberedWord.containsMatchIn(hay) || wordThenNumber.containsMatchIn(hay) ||
+            hintWords.any { hay.contains(it) }
+        if (!looksEpisode) return@mapNotNull null
+        EpisodeInfo(title = text.ifBlank { "Bölüm" }, url = href)
+    }.distinctBy { it.url }.take(200)
+}
+
 class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
     val sites = db.siteDao().observeSites().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
     val allItems = db.itemDao().observeAll().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
@@ -321,6 +345,9 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
     var previewError by mutableStateOf(""); private set
     var livePreviewItems by mutableStateOf<List<LivePreviewItem>>(emptyList()); private set
     var streamBusy by mutableStateOf(false); private set
+    var episodeParent by mutableStateOf<ScrapedItemEntity?>(null); private set
+    var episodes by mutableStateOf<List<EpisodeInfo>>(emptyList()); private set
+    var episodesBusy by mutableStateOf(false); private set
     private var previewJob: kotlinx.coroutines.Job? = null
 
     fun loadPreviewHtml(site: SiteEntity) {
@@ -404,25 +431,59 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
 
     fun select(site: SiteEntity) { selectedSiteId = site.id }
 
+    /** İçerik kartına tıklandığında çağrılır: dizi/anime ise önce bölüm listesini gösterir,
+     *  film/belgesel gibi tek parçalı içeriklerde doğrudan akış linkini arar. */
+    fun openItem(context: Context, item: ScrapedItemEntity) {
+        if (item.category == "Dizi" || item.category == "Anime") loadEpisodes(context, item)
+        else openStream(context, item)
+    }
+
+    /** Dizi/anime detay sayfasını tarayıp bölüm linklerini bulur ve diyalogda gösterir.
+     *  Hiç bölüm bulunamazsa (aslında tek parçalık bir sayfaysa) doğrudan akış linkine düşer. */
+    fun loadEpisodes(context: Context, item: ScrapedItemEntity) {
+        if (episodesBusy) return
+        episodesBusy = true; episodeParent = item; episodes = emptyList()
+        message = "Bölümler aranıyor: ${item.title}"
+        viewModelScope.launch(Dispatchers.IO) {
+            val found = try {
+                val doc = Jsoup.connect(item.url).userAgent("Mozilla/5.0 (Android) ScrapeFlix/0.10").timeout(15000).followRedirects(true).get()
+                extractEpisodes(doc, item.url)
+            } catch (e: Exception) { emptyList() }
+            withContext(Dispatchers.Main) {
+                episodesBusy = false
+                if (found.isNotEmpty()) {
+                    episodes = found; message = ""
+                } else {
+                    episodeParent = null
+                    openStream(context, item)
+                }
+            }
+        }
+    }
+
+    fun closeEpisodes() { episodeParent = null; episodes = emptyList() }
+
     /** İçerik kartına tıklandığında: sayfadaki gerçek akış linkini bulur ve doğrudan
      *  o linki, cihazdaki uyumlu uygulamalar arasından seçim yaptırarak açar (tarayıcı yok).
      *  Önce hızlı statik HTML analizini dener; bulamazsa 1DM benzeri bir yöntemle,
      *  sayfayı gizli bir WebView'de gerçekten çalıştırıp ağ isteklerini dinleyerek arar. */
-    fun openStream(context: Context, item: ScrapedItemEntity) {
+    fun openStream(context: Context, item: ScrapedItemEntity) = openStream(context, item.title, item.url)
+
+    fun openStream(context: Context, title: String, url: String) {
         if (streamBusy) return
-        streamBusy = true; message = "Akış linki aranıyor: ${item.title}"
+        streamBusy = true; message = "Akış linki aranıyor: $title"
         viewModelScope.launch {
-            var streamUrl = withContext(Dispatchers.IO) { resolveStreamUrl(item.url) }
+            var streamUrl = withContext(Dispatchers.IO) { resolveStreamUrl(url) }
             if (streamUrl == null) {
-                message = "Sayfa açılıp oynatma tetikleniyor: ${item.title}"
-                streamUrl = sniffStreamUrlViaWebView(context, item.url)
+                message = "Sayfa açılıp oynatma tetikleniyor: $title"
+                streamUrl = sniffStreamUrlViaWebView(context, url)
             }
             streamBusy = false
             if (streamUrl != null) {
                 message = ""
                 openContent(context, streamUrl)
             } else {
-                message = "Akış linki bulunamadı: ${item.title}"
+                message = "Akış linki bulunamadı: $title"
             }
         }
     }
@@ -550,13 +611,13 @@ enum class Page { Home, Sites, Watch, Settings }
             }
         }
         Spacer(Modifier.height(8.dp))
-        if (vm.streamBusy) LinearProgressIndicator(Modifier.fillMaxWidth())
+        if (vm.streamBusy || vm.episodesBusy) LinearProgressIndicator(Modifier.fillMaxWidth())
         if (vm.message.isNotBlank()) Text(vm.message, color = Color.LightGray, fontSize = 12.sp, modifier = Modifier.padding(vertical = 4.dp))
         Spacer(Modifier.height(2.dp))
         if (filtered.isEmpty()) Text("Sonuç bulunamadı.", color = Color.Gray) else LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
             items(filtered) { item ->
                 Card(
-                    modifier = Modifier.fillMaxWidth().clickable { vm.openStream(context, item) },
+                    modifier = Modifier.fillMaxWidth().clickable { vm.openItem(context, item) },
                     colors = CardDefaults.cardColors(containerColor = Color(0xFF191919))
                 ) {
                     Row(Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -583,6 +644,39 @@ enum class Page { Home, Sites, Watch, Settings }
                 }
             }
         }
+    }
+    vm.episodeParent?.let { parent ->
+        AlertDialog(
+            onDismissRequest = { vm.closeEpisodes() },
+            confirmButton = { TextButton({ vm.closeEpisodes() }) { Text("Kapat") } },
+            title = { Text(parent.title) },
+            text = {
+                Column(Modifier.heightIn(max = 420.dp)) {
+                    if (vm.episodesBusy) {
+                        LinearProgressIndicator(Modifier.fillMaxWidth())
+                        Spacer(Modifier.height(8.dp))
+                        Text("Bölümler aranıyor...", color = Color.Gray)
+                    } else if (vm.episodes.isEmpty()) {
+                        Text("Bölüm bulunamadı.", color = Color.Gray)
+                    } else {
+                        LazyColumn(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            items(vm.episodes) { ep ->
+                                Text(
+                                    ep.title,
+                                    modifier = Modifier.fillMaxWidth()
+                                        .clickable {
+                                            vm.closeEpisodes()
+                                            vm.openStream(context, ep.title, ep.url)
+                                        }
+                                        .padding(vertical = 12.dp)
+                                )
+                                HorizontalDivider(color = Color(0xFF2A2A2A))
+                            }
+                        }
+                    }
+                }
+            }
+        )
     }
 }
 
@@ -761,6 +855,6 @@ fun SiteEditorDialog(
 
 @Composable fun AddSiteDialog(onDismiss:()->Unit,onAdd:(String,String)->Unit){var n by remember{mutableStateOf("")};var u by remember{mutableStateOf("")};AlertDialog(onDismissRequest=onDismiss,title={Text("Yeni Site Ekle")},text={Column(verticalArrangement=Arrangement.spacedBy(10.dp)){OutlinedTextField(n,{n=it},label={Text("Site adı")});OutlinedTextField(u,{u=it},label={Text("Site adresi")})}},confirmButton={Button({onAdd(n,u)},enabled=u.isNotBlank()){Text("Kaydet")}},dismissButton={TextButton(onDismiss){Text("İptal")}})}
 
-@Composable fun SettingsScreen(){Column(Modifier.fillMaxSize().padding(20.dp)){Text("Ayarlar",fontSize=28.sp,fontWeight=FontWeight.Bold);Spacer(Modifier.height(16.dp));Text("ScrapeFlix v0.9.0",fontWeight=FontWeight.Bold);Spacer(Modifier.height(8.dp));Text("v0.9: Akış linki aramada artık 1DM'e benzer şekilde sayfa yüklendikten sonra play düğmesine benzeyen elemanlar ve <video> etiketleri JS ile birkaç turda tıklanıp/oynatılıp gerçek player tetikleniyor, bu sırada atılan ağ istekleri dinleniyor.",color=Color.Gray)}}
+@Composable fun SettingsScreen(){Column(Modifier.fillMaxSize().padding(20.dp)){Text("Ayarlar",fontSize=28.sp,fontWeight=FontWeight.Bold);Spacer(Modifier.height(16.dp));Text("ScrapeFlix v0.10.0",fontWeight=FontWeight.Bold);Spacer(Modifier.height(8.dp));Text("v0.10: Dizi/Anime kategorisindeki içeriklere tıklandığında artık önce bölüm listesi gösteriliyor; bir bölüme tıklanınca o bölümün akış linki aranıp uygulama seçtiriliyor.",color=Color.Gray)}}
 
 class MainActivity:ComponentActivity(){override fun onCreate(b:Bundle?){super.onCreate(b);setContent{App()}}}
