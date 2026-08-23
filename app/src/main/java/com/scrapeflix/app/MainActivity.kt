@@ -15,6 +15,7 @@ import androidx.activity.compose.setContent
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -152,27 +153,35 @@ private fun guessCategoryStatic(title: String, url: String): String {
     }
 }
 
-/** İçeriği tıklandığında tarayıcı yerine cihazdaki uygun uygulamalar arasından seçim yaptırır. */
+/** İçeriği tıklandığında tarayıcı yerine cihazdaki uygun uygulamalar arasından seçim yaptırır.
+ *  Bu fonksiyon sadece zaten akış linki olarak DOĞRULANMIŞ URL'lerle çağrılır (resolveStreamUrl /
+ *  sniffStreamUrlViaWebView tarafından bulunmuş), bu yüzden uzantı belirsiz/gizlenmiş olsa bile
+ *  (ör. ".txt" ile maskelenmiş m3u8) MIME tipi her zaman video/akış olarak zorlanır — aksi halde
+ *  Android bu isteği sadece tarayıcılara yönlendirir ve video oynatıcı uygulamalar hiç çıkmaz. */
 private fun openContent(context: Context, url: String) {
     val cleanUrl = url.substringBefore('?')
     val ext = cleanUrl.substringAfterLast('.', "").lowercase()
     val mimeType = when (ext) {
-        "mp4", "mkv", "webm", "avi", "mov", "3gp", "ts" -> "video/*"
         "m3u8" -> "application/vnd.apple.mpegurl"
         "mpd" -> "application/dash+xml"
-        else -> null
+        else -> "video/*"
     }
     val viewIntent = Intent(Intent.ACTION_VIEW).apply {
-        if (mimeType != null) setDataAndType(Uri.parse(url), mimeType) else data = Uri.parse(url)
+        setDataAndType(Uri.parse(url), mimeType)
     }
-    val chooser = Intent.createChooser(viewIntent, "İçeriği şununla aç").apply {
+    val chooser = Intent.createChooser(viewIntent, "Hangi uygulamada oynatılsın?").apply {
         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     }
     try {
         context.startActivity(chooser)
     } catch (e: Exception) {
         try {
-            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) })
+            context.startActivity(
+                Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(Uri.parse(url), mimeType)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+            )
         } catch (e2: Exception) { /* açılacak uygulama yok */ }
     }
 }
@@ -426,6 +435,8 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
     val sites = db.siteDao().observeSites().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
     val allItems = db.itemDao().observeAll().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
     var selectedSiteId by mutableStateOf<Long?>(null); private set
+    var watchFilterSiteId by mutableStateOf<Long?>(null); private set
+    fun setWatchFilter(siteId: Long?) { watchFilterSiteId = siteId }
     var busy by mutableStateOf(false); private set
     var message by mutableStateOf(""); private set
     var suggestions by mutableStateOf<List<ProfileSuggestion>>(emptyList()); private set
@@ -661,7 +672,7 @@ enum class Page { Home, Sites, Watch, Settings }
 @Composable fun App(vm:ScrapeViewModel=viewModel(factory=VmFactory(LocalContext.current))) {
     var page by remember{mutableStateOf(Page.Home)}; var add by remember{mutableStateOf(false)}; var editor by remember{mutableStateOf<SiteEntity?>(null)}; var preview by remember{mutableStateOf(false)}
     MaterialTheme(colorScheme=darkColorScheme(background=Color(0xFF080808),surface=Color(0xFF151515),primary=Color(0xFFE50914))) {
-        Scaffold(containerColor=Color(0xFF080808),topBar={TopAppBar(title={Text("SCRAPEFLIX",fontWeight=FontWeight.Bold)},colors=TopAppBarDefaults.topAppBarColors(containerColor=Color.Black,titleContentColor=Color.White),actions={IconButton({add=true}){Icon(Icons.Default.Add,"Yeni site")}})},bottomBar={NavigationBar(containerColor=Color.Black){NavigationBarItem(page==Page.Home,{page=Page.Home},icon={Icon(Icons.Default.Home,null)},label={Text("Ana")});NavigationBarItem(page==Page.Sites,{page=Page.Sites},icon={Icon(Icons.Default.Language,null)},label={Text("Siteler")});NavigationBarItem(page==Page.Watch,{page=Page.Watch},icon={Icon(Icons.Default.PlayArrow,null)},label={Text("İçerikler")});NavigationBarItem(page==Page.Settings,{page=Page.Settings},icon={Icon(Icons.Default.Settings,null)},label={Text("Ayarlar")})}}){pad->Box(Modifier.padding(pad).fillMaxSize()){when(page){Page.Home->HomeScreen(vm){page=Page.Sites};Page.Sites->SitesScreen(vm, {add=true}) {editor=it};Page.Watch->WatchScreen(vm);Page.Settings->SettingsScreen()}}}
+        Scaffold(containerColor=Color(0xFF080808),topBar={TopAppBar(title={Text("SCRAPEFLIX",fontWeight=FontWeight.Bold)},colors=TopAppBarDefaults.topAppBarColors(containerColor=Color.Black,titleContentColor=Color.White),actions={IconButton({add=true}){Icon(Icons.Default.Add,"Yeni site")}})},bottomBar={NavigationBar(containerColor=Color.Black){NavigationBarItem(page==Page.Home,{page=Page.Home},icon={Icon(Icons.Default.Home,null)},label={Text("Ana")});NavigationBarItem(page==Page.Sites,{page=Page.Sites},icon={Icon(Icons.Default.Language,null)},label={Text("Siteler")});NavigationBarItem(page==Page.Watch,{page=Page.Watch},icon={Icon(Icons.Default.PlayArrow,null)},label={Text("İçerikler")});NavigationBarItem(page==Page.Settings,{page=Page.Settings},icon={Icon(Icons.Default.Settings,null)},label={Text("Ayarlar")})}}){pad->Box(Modifier.padding(pad).fillMaxSize()){when(page){Page.Home->HomeScreen(vm){page=Page.Sites};Page.Sites->SitesScreen(vm, {add=true}, {editor=it}) {s->vm.setWatchFilter(s.id);page=Page.Watch};Page.Watch->WatchScreen(vm);Page.Settings->SettingsScreen()}}}
         if(add)AddSiteDialog({add=false}){n,u->vm.addSite(n,u);add=false;page=Page.Sites}
         editor?.let{
             LaunchedEffect(it.id) { vm.loadPreviewHtml(it) }
@@ -681,18 +692,38 @@ enum class Page { Home, Sites, Watch, Settings }
 
 @Composable fun HomeScreen(vm:ScrapeViewModel,open:()->Unit){val sites by vm.sites.collectAsState();val all by vm.allItems.collectAsState();LazyColumn(Modifier.fillMaxSize().padding(16.dp),verticalArrangement=Arrangement.spacedBy(14.dp)){item{Text("Ana Sayfa",fontSize=28.sp,fontWeight=FontWeight.Bold);Text("${sites.size} site • ${all.size} içerik",color=Color.Gray)};item{Button(open,Modifier.fillMaxWidth()){Icon(Icons.Default.Language,null);Spacer(Modifier.width(8.dp));Text("Sitelerimi Yönet")}};items(sites){s->SiteCard(s,{vm.analyze(s)},{vm.scrape(s)},{vm.deleteSite(s)})}}}
 
-@Composable fun SitesScreen(vm:ScrapeViewModel,onAdd:()->Unit,onEdit:(SiteEntity)->Unit){val sites by vm.sites.collectAsState();Column(Modifier.fillMaxSize().padding(16.dp)){Row(Modifier.fillMaxWidth(),Arrangement.SpaceBetween,Alignment.CenterVertically){Column{Text("Sitelerim",fontSize=26.sp,fontWeight=FontWeight.Bold);Text("Analiz • önizleme • profil",color=Color.Gray)};FilledTonalButton(onAdd){Icon(Icons.Default.Add,null);Text(" Ekle")}};Spacer(Modifier.height(14.dp));if(vm.busy)LinearProgressIndicator(Modifier.fillMaxWidth());if(vm.message.isNotBlank())Text(vm.message,color=Color.LightGray,modifier=Modifier.padding(vertical=8.dp));LazyColumn(verticalArrangement=Arrangement.spacedBy(10.dp)){items(sites){s->SiteCard(s,{vm.analyze(s)},{vm.scrape(s)},{vm.deleteSite(s)});TextButton({onEdit(s)}){Icon(Icons.Default.Edit,null);Text(" Profil / Önizleme")}}}}}
+@Composable fun SitesScreen(vm:ScrapeViewModel,onAdd:()->Unit,onEdit:(SiteEntity)->Unit,onOpenContent:(SiteEntity)->Unit){val sites by vm.sites.collectAsState();Column(Modifier.fillMaxSize().padding(16.dp)){Row(Modifier.fillMaxWidth(),Arrangement.SpaceBetween,Alignment.CenterVertically){Column{Text("Sitelerim",fontSize=26.sp,fontWeight=FontWeight.Bold);Text("Analiz • önizleme • profil",color=Color.Gray)};FilledTonalButton(onAdd){Icon(Icons.Default.Add,null);Text(" Ekle")}};Spacer(Modifier.height(14.dp));if(vm.busy)LinearProgressIndicator(Modifier.fillMaxWidth());if(vm.message.isNotBlank())Text(vm.message,color=Color.LightGray,modifier=Modifier.padding(vertical=8.dp));LazyColumn(verticalArrangement=Arrangement.spacedBy(10.dp)){items(sites){s->SiteCard(s,{vm.analyze(s)},{vm.scrape(s)},{vm.deleteSite(s)},{onOpenContent(s)});TextButton({onEdit(s)}){Icon(Icons.Default.Edit,null);Text(" Profil / Önizleme")}}}}}
 
-@Composable fun SiteCard(site:SiteEntity,onAnalyze:()->Unit,onScrape:()->Unit,onDelete:()->Unit){Card(Modifier.fillMaxWidth(),shape=RoundedCornerShape(14.dp),colors=CardDefaults.cardColors(containerColor=Color(0xFF191919))){Column(Modifier.padding(14.dp)){Text(site.name,fontSize=19.sp,fontWeight=FontWeight.Bold);Text(site.url,color=Color.Gray,maxLines=1);Text("${site.itemCount} içerik • ${site.profileStatus}",color=Color.LightGray,fontSize=13.sp);Row(horizontalArrangement=Arrangement.spacedBy(2.dp)){TextButton(onAnalyze){Icon(Icons.Default.Search,null);Text(" Analiz")};TextButton(onScrape){Icon(Icons.Default.Refresh,null);Text(" Tara")};TextButton(onDelete){Icon(Icons.Default.Delete,null);Text(" Sil")}}}}}
+@Composable fun SiteCard(site:SiteEntity,onAnalyze:()->Unit,onScrape:()->Unit,onDelete:()->Unit,onOpenContent:()->Unit={}){Card(Modifier.fillMaxWidth(),shape=RoundedCornerShape(14.dp),colors=CardDefaults.cardColors(containerColor=Color(0xFF191919))){Column(Modifier.padding(14.dp)){Text(site.name,fontSize=19.sp,fontWeight=FontWeight.Bold);Text(site.url,color=Color.Gray,maxLines=1);Text("${site.itemCount} içerik • ${site.profileStatus}",color=Color.LightGray,fontSize=13.sp);Row(horizontalArrangement=Arrangement.spacedBy(2.dp)){TextButton(onAnalyze){Icon(Icons.Default.Search,null);Text(" Analiz")};TextButton(onScrape){Icon(Icons.Default.Refresh,null);Text(" Tara")};TextButton(onDelete){Icon(Icons.Default.Delete,null);Text(" Sil")}};if(site.itemCount>0)TextButton(onOpenContent,Modifier.fillMaxWidth()){Icon(Icons.Default.PlayArrow,null);Text(" Bu Sitenin İçeriklerini Gör (${site.itemCount})")}}}}
 
 @Composable fun WatchScreen(vm: ScrapeViewModel) {
     val items by vm.allItems.collectAsState()
+    val sites by vm.sites.collectAsState()
     val context = LocalContext.current
     var q by remember { mutableStateOf("") }
     var cat by remember { mutableStateOf("Tümü") }
-    val filtered = items.filter { (q.isBlank() || it.title.contains(q, true)) && (cat == "Tümü" || it.category == cat) }
+    val filterSiteId = vm.watchFilterSiteId
+    val filtered = items.filter {
+        (filterSiteId == null || it.siteId == filterSiteId) &&
+            (q.isBlank() || it.title.contains(q, true)) &&
+            (cat == "Tümü" || it.category == cat)
+    }
     Column(Modifier.fillMaxSize().padding(16.dp)) {
         Text("İçerikler", fontSize = 28.sp, fontWeight = FontWeight.Bold)
+        if (sites.isNotEmpty()) {
+            Spacer(Modifier.height(8.dp))
+            Text("Site", color = Color.Gray, fontSize = 12.sp)
+            Spacer(Modifier.height(4.dp))
+            LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                item {
+                    FilterChip(selected = filterSiteId == null, onClick = { vm.setWatchFilter(null) }, label = { Text("Tümü (${items.size})") })
+                }
+                items(sites) { s ->
+                    FilterChip(selected = filterSiteId == s.id, onClick = { vm.setWatchFilter(s.id) }, label = { Text("${s.name} (${s.itemCount})") })
+                }
+            }
+        }
+        Spacer(Modifier.height(10.dp))
         OutlinedTextField(q, { q = it }, Modifier.fillMaxWidth(), label = { Text("İçerik ara") })
         Spacer(Modifier.height(8.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -945,6 +976,6 @@ fun SiteEditorDialog(
 
 @Composable fun AddSiteDialog(onDismiss:()->Unit,onAdd:(String,String)->Unit){var n by remember{mutableStateOf("")};var u by remember{mutableStateOf("")};AlertDialog(onDismissRequest=onDismiss,title={Text("Yeni Site Ekle")},text={Column(verticalArrangement=Arrangement.spacedBy(10.dp)){OutlinedTextField(n,{n=it},label={Text("Site adı")});OutlinedTextField(u,{u=it},label={Text("Site adresi")})}},confirmButton={Button({onAdd(n,u)},enabled=u.isNotBlank()){Text("Kaydet")}},dismissButton={TextButton(onDismiss){Text("İptal")}})}
 
-@Composable fun SettingsScreen(){Column(Modifier.fillMaxSize().padding(20.dp)){Text("Ayarlar",fontSize=28.sp,fontWeight=FontWeight.Bold);Spacer(Modifier.height(16.dp));Text("ScrapeFlix v0.11.0",fontWeight=FontWeight.Bold);Spacer(Modifier.height(8.dp));Text("v0.11: Akış linki bulma çok daha güçlü: uzantısı gizlenmiş dosyalar (ör. .txt ile maskelenmiş m3u8) içerik imzasına bakılarak yakalanıyor; reklam geçme/oynat tıklamaları artık 34 saniyelik bir pencerede 10 turda tekrarlanıyor.",color=Color.Gray)}}
+@Composable fun SettingsScreen(){Column(Modifier.fillMaxSize().padding(20.dp)){Text("Ayarlar",fontSize=28.sp,fontWeight=FontWeight.Bold);Spacer(Modifier.height(16.dp));Text("ScrapeFlix v0.12.0",fontWeight=FontWeight.Bold);Spacer(Modifier.height(8.dp));Text("v0.12: İçerikler artık siteye göre filtrelenebiliyor (Sitelerim'den 'İçerikleri Gör' veya İçerikler ekranındaki site çipleri). Akış linki bulunduğunda artık her zaman video MIME tipiyle açılıyor, böylece tarayıcıya değil cihazdaki video oynatıcılara yönlendiriliyor.",color=Color.Gray)}}
 
 class MainActivity:ComponentActivity(){override fun onCreate(b:Bundle?){super.onCreate(b);setContent{App()}}}
