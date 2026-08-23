@@ -12,12 +12,15 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -30,6 +33,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
@@ -114,6 +118,25 @@ private fun Element.guessTitle(): String =
 private fun normalizeUrl(url: String) = if (url.trim().startsWith("http://") || url.trim().startsWith("https://")) url.trim() else "https://${url.trim()}"
 
 data class MenuLink(val label: String, val url: String)
+
+private fun normalizeUrlKey(url: String): String = url.substringBefore('#').trimEnd('/')
+
+/** Bir listeleme/menü sayfasında "sonraki sayfa" (sayfalama) linkini bulmaya çalışır. */
+private fun findNextPageUrl(doc: Document, baseUrl: String): String? {
+    doc.selectFirst("link[rel=next]")?.absUrl("href")?.takeUnless { it.isBlank() }?.let { return it }
+    val candidates = doc.select(
+        "a[rel=next], .pagination a[href], [class*=pagination] a[href], [class*=page-numbers] a[href], nav[class*=page] a[href]"
+    )
+    for (a in candidates) {
+        val t = a.text().trim().lowercase(Locale.getDefault())
+        val rel = a.attr("rel")
+        if (rel == "next" || t in setOf("sonraki", "next", "»", "ileri", ">", "sonraki sayfa")) {
+            val href = a.absUrl("href")
+            if (href.isNotBlank() && normalizeUrlKey(href) != normalizeUrlKey(baseUrl)) return href
+        }
+    }
+    return null
+}
 
 /** Sitenin nav/menü alanlarındaki alt sayfa linklerini, görünen menü etiketiyle birlikte bulur
  *  (aynı domain, tekrarsız). Bu etiket, o alt sayfadan çıkan içeriklerin başlığı olarak
@@ -466,6 +489,9 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
     var livePreviewItems by mutableStateOf<List<LivePreviewItem>>(emptyList()); private set
     var streamBusy by mutableStateOf(false); private set
     var episodeParent by mutableStateOf<ScrapedItemEntity?>(null); private set
+    var detailItem by mutableStateOf<ScrapedItemEntity?>(null); private set
+    fun openDetail(item: ScrapedItemEntity) { detailItem = item }
+    fun closeDetail() { detailItem = null }
     var episodes by mutableStateOf<List<EpisodeInfo>>(emptyList()); private set
     var episodesBusy by mutableStateOf(false); private set
     private var previewJob: kotlinx.coroutines.Job? = null
@@ -655,37 +681,76 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
         if (busy) return; busy = true; selectedSiteId = site.id; message = "Ana sayfa taranıyor..."
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val mainDoc = Jsoup.connect(site.url).userAgent("Mozilla/5.0 (Android) ScrapeFlix/0.13").timeout(20000).followRedirects(true).get()
-                val subPages = discoverSubPages(mainDoc, site.url)
-                withContext(Dispatchers.Main) { message = if (subPages.isNotEmpty()) "${subPages.size} menü bulundu, taranıyor..." else "Menü bulunamadı, ana sayfa taranıyor..." }
+                val ua = "Mozilla/5.0 (Android) ScrapeFlix/0.14"
+                suspend fun fetch(url: String): Document? = try {
+                    Jsoup.connect(url).userAgent(ua).timeout(12000).followRedirects(true).get()
+                } catch (e: Exception) { null }
 
-                val fetchedSubPages: List<Pair<MenuLink, Document>> = if (subPages.isNotEmpty()) {
-                    val semaphore = Semaphore(4)
-                    subPages.map { link ->
-                        async {
-                            semaphore.withPermit {
-                                try {
-                                    link to Jsoup.connect(link.url).userAgent("Mozilla/5.0 (Android) ScrapeFlix/0.13").timeout(12000).followRedirects(true).get()
-                                } catch (e: Exception) { null }
-                            }
-                        }
-                    }.awaitAll().filterNotNull()
-                } else emptyList()
-
-                // Alt menü sayfaları önce işlenir ki bir içerik birden fazla yerde görünüyorsa
-                // (ör. hem anasayfada hem bir menüde) sitenin gerçek menü adı kazansın; anasayfa
-                // içerikleri en son eklenir ve sadece hiçbir menüde geçmeyenler "Ana Sayfa" alır.
+                val visited = mutableSetOf<String>()
                 val found = mutableListOf<ScrapedItemEntity>()
                 var order = 0
-                for ((link, doc) in fetchedSubPages) {
-                    extractItems(doc, site, link.label).forEach { found += it.copy(sortOrder = order++) }
+                var pageBudget = 90 // toplam sayfa isteği bütçesi (site çok büyükse taramayı sınırlar)
+                val maxDepth = 2 // 1: ana menü, 2: onun alt menüsü
+                val semaphore = Semaphore(4)
+                var pagesScanned = 0
+
+                visited.add(normalizeUrlKey(site.url))
+                val mainDoc = Jsoup.connect(site.url).userAgent(ua).timeout(20000).followRedirects(true).get()
+                pagesScanned++
+
+                val level1 = discoverSubPages(mainDoc, site.url).filter { visited.add(normalizeUrlKey(it.url)) }
+                withContext(Dispatchers.Main) { message = if (level1.isNotEmpty()) "${level1.size} menü bulundu, taranıyor..." else "Menü bulunamadı, ana sayfa taranıyor..." }
+
+                var currentLevel = level1.map { MenuLink(it.label, it.url) to 1 }
+                var depth = 1
+                while (currentLevel.isNotEmpty() && depth <= maxDepth && pageBudget > 0) {
+                    val batch = currentLevel.take(pageBudget)
+                    val results = batch.map { (link, d) ->
+                        async { semaphore.withPermit { Triple(link, d, fetch(link.url)) } }
+                    }.awaitAll()
+                    pageBudget -= batch.size
+
+                    val nextLevel = mutableListOf<Pair<MenuLink, Int>>()
+                    for ((link, d, doc0) in results) {
+                        if (doc0 == null) continue
+                        var page = doc0
+                        extractItems(page, site, link.label).forEach { found += it.copy(sortOrder = order++) }
+                        pagesScanned++
+
+                        // Bu menünün sayfalamasını (2., 3. sayfa...) da takip et.
+                        var pageCount = 0
+                        while (pageBudget > 0 && pageCount < 8) {
+                            val nextUrl = findNextPageUrl(page, link.url) ?: break
+                            if (!visited.add(normalizeUrlKey(nextUrl))) break
+                            val nextDoc = fetch(nextUrl) ?: break
+                            pageBudget--; pageCount++; pagesScanned++
+                            extractItems(nextDoc, site, link.label).forEach { found += it.copy(sortOrder = order++) }
+                            page = nextDoc
+                        }
+
+                        // Bu sayfanın kendi alt menüsünü keşfet (bir sonraki derinlik için).
+                        if (d < maxDepth) {
+                            discoverSubPages(doc0, link.url).forEach { child ->
+                                if (visited.add(normalizeUrlKey(child.url))) {
+                                    nextLevel += MenuLink("${link.label} · ${child.label}", child.url) to (d + 1)
+                                }
+                            }
+                        }
+                    }
+                    withContext(Dispatchers.Main) { message = "$pagesScanned sayfa tarandı, devam ediliyor..." }
+                    currentLevel = nextLevel
+                    depth++
                 }
+
+                // Ana sayfa içerikleri en son eklenir ki bir içerik birden fazla yerde görünüyorsa
+                // sitenin gerçek (daha spesifik) menü adı kazansın; anasayfada olup hiçbir menüde
+                // geçmeyenler "Ana Sayfa" başlığı altında toplanır.
                 extractItems(mainDoc, site, "Ana Sayfa").forEach { found += it.copy(sortOrder = order++) }
 
-                val deduped = found.distinctBy { it.url }.take(800)
+                val deduped = found.distinctBy { it.url }.take(3000)
                 db.itemDao().deleteForSite(site.id); if (deduped.isNotEmpty()) db.itemDao().insertAll(deduped)
                 db.siteDao().update(site.copy(lastUpdated=System.currentTimeMillis(),itemCount=deduped.size,profileStatus="Aktif"))
-                withContext(Dispatchers.Main) { message = "${fetchedSubPages.size + 1} sayfa tarandı, ${deduped.size} içerik bulundu."; busy = false }
+                withContext(Dispatchers.Main) { message = "$pagesScanned sayfa tarandı, ${deduped.size} içerik bulundu."; busy = false }
             } catch (e: Exception) { withContext(Dispatchers.Main) { message="Tarama başarısız: ${e.message ?: "Bilinmeyen hata"}"; busy=false } }
         }
     }
@@ -780,7 +845,11 @@ enum class Page { Home, Sites, Watch, Settings }
                         modifier = Modifier.padding(top = 12.dp, bottom = 6.dp)
                     )
                 }
-                items(section.list, key = { it.id }) { it2 -> ContentItemCard(vm, context, it2) }
+                item(key = "row-${section.header}") {
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.padding(bottom = 4.dp)) {
+                        items(section.list, key = { it.id }) { it2 -> PosterCard(context, it2) { vm.openDetail(it2) } }
+                    }
+                }
             }
             item { Spacer(Modifier.height(12.dp)) }
         }
@@ -818,39 +887,95 @@ enum class Page { Home, Sites, Watch, Settings }
             }
         )
     }
+    vm.detailItem?.let { item ->
+        DetailDialog(vm = vm, context = context, item = item)
+    }
 }
 
 @Composable
-private fun ContentItemCard(vm: ScrapeViewModel, context: Context, item: ScrapedItemEntity) {
-    Card(
-        modifier = Modifier.fillMaxWidth().clickable { vm.openItem(context, item) },
-        colors = CardDefaults.cardColors(containerColor = Color(0xFF191919))
-    ) {
-        Row(Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
-            if (!item.imageUrl.isNullOrBlank()) {
-                AsyncImage(
-                    model = coil.request.ImageRequest.Builder(context)
-                        .data(item.imageUrl)
-                        .addHeader("User-Agent", "Mozilla/5.0 (Android) ScrapeFlix/0.13")
-                        .addHeader("Referer", refererFor(item.url))
-                        .crossfade(true)
-                        .build(),
-                    contentDescription = item.title,
-                    contentScale = androidx.compose.ui.layout.ContentScale.Crop,
-                    modifier = Modifier.size(90.dp, 70.dp).clip(RoundedCornerShape(6.dp))
-                )
-                Spacer(Modifier.width(10.dp))
+private fun PosterCard(context: Context, item: ScrapedItemEntity, onClick: () -> Unit) {
+    Column(modifier = Modifier.width(118.dp).clickable { onClick() }) {
+        if (!item.imageUrl.isNullOrBlank()) {
+            AsyncImage(
+                model = coil.request.ImageRequest.Builder(context)
+                    .data(item.imageUrl)
+                    .addHeader("User-Agent", "Mozilla/5.0 (Android) ScrapeFlix/0.14")
+                    .addHeader("Referer", refererFor(item.url))
+                    .crossfade(true)
+                    .build(),
+                contentDescription = item.title,
+                contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+                modifier = Modifier.fillMaxWidth().height(168.dp).clip(RoundedCornerShape(8.dp))
+            )
+        } else {
+            Box(
+                Modifier.fillMaxWidth().height(168.dp).clip(RoundedCornerShape(8.dp)).background(Color(0xFF232323)),
+                contentAlignment = Alignment.Center
+            ) { Icon(Icons.Default.Movie, null, tint = Color(0xFF555555)) }
+        }
+        Spacer(Modifier.height(6.dp))
+        Text(item.title, fontSize = 12.sp, fontWeight = FontWeight.Medium, maxLines = 2, color = Color.White)
+        if (item.year != null || item.rating != null) {
+            Row {
+                item.year?.let { Text(it, color = Color(0xFFD4AF37), fontSize = 10.sp) }
+                if (item.year != null && item.rating != null) Text(" • ", color = Color.Gray, fontSize = 10.sp)
+                item.rating?.let { Text("★$it", color = Color(0xFFD4AF37), fontSize = 10.sp) }
             }
-            Column {
-                Text(item.title, fontWeight = FontWeight.Bold, maxLines = 2)
-                if (item.year != null || item.rating != null) {
-                    Row {
-                        item.year?.let { Text(it, color = Color(0xFFD4AF37), fontSize = 12.sp, fontWeight = FontWeight.SemiBold) }
-                        if (item.year != null && item.rating != null) Text(" • ", color = Color.Gray, fontSize = 12.sp)
-                        item.rating?.let { Text("★ $it", color = Color(0xFFD4AF37), fontSize = 12.sp, fontWeight = FontWeight.SemiBold) }
+        }
+    }
+}
+
+/** Bir içeriğe dokunulduğunda açılan ayrı detay kartı: görsel, başlık, yıl/puan, özet ve
+ *  gerçek "İzle" eylemi (bölüm var mı diye bakar, akış linkini bulur, uygulama seçtirir). */
+@Composable
+private fun DetailDialog(vm: ScrapeViewModel, context: Context, item: ScrapedItemEntity) {
+    Dialog(onDismissRequest = { vm.closeDetail() }) {
+        Card(
+            shape = RoundedCornerShape(16.dp),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF141414))
+        ) {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
+                if (!item.imageUrl.isNullOrBlank()) {
+                    AsyncImage(
+                        model = coil.request.ImageRequest.Builder(context)
+                            .data(item.imageUrl)
+                            .addHeader("User-Agent", "Mozilla/5.0 (Android) ScrapeFlix/0.14")
+                            .addHeader("Referer", refererFor(item.url))
+                            .crossfade(true)
+                            .build(),
+                        contentDescription = item.title,
+                        contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+                        modifier = Modifier.fillMaxWidth().height(220.dp)
+                    )
+                }
+                Column(Modifier.padding(18.dp)) {
+                    Text(item.title, fontSize = 20.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                    Spacer(Modifier.height(6.dp))
+                    if (item.year != null || item.rating != null) {
+                        Row {
+                            item.year?.let { Text(it, color = Color(0xFFD4AF37), fontWeight = FontWeight.SemiBold, fontSize = 14.sp) }
+                            if (item.year != null && item.rating != null) Text(" • ", color = Color.Gray)
+                            item.rating?.let { Text("★ $it", color = Color(0xFFD4AF37), fontWeight = FontWeight.SemiBold, fontSize = 14.sp) }
+                        }
+                        Spacer(Modifier.height(6.dp))
+                    }
+                    Text(item.category, color = Color.Gray, fontSize = 12.sp)
+                    Spacer(Modifier.height(12.dp))
+                    Text(
+                        item.description?.takeUnless { it.isBlank() } ?: "Özet bulunamadı.",
+                        color = Color.LightGray, fontSize = 14.sp
+                    )
+                    Spacer(Modifier.height(18.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                        Button(
+                            onClick = { vm.closeDetail(); vm.openItem(context, item) },
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Icon(Icons.Default.PlayArrow, null); Spacer(Modifier.width(6.dp)); Text("İzle")
+                        }
+                        OutlinedButton(onClick = { vm.closeDetail() }) { Text("Kapat") }
                     }
                 }
-                item.description?.let { Text(it, color = Color.Gray, maxLines = 2, fontSize = 12.sp) }
             }
         }
     }
@@ -1031,6 +1156,6 @@ fun SiteEditorDialog(
 
 @Composable fun AddSiteDialog(onDismiss:()->Unit,onAdd:(String,String)->Unit){var n by remember{mutableStateOf("")};var u by remember{mutableStateOf("")};AlertDialog(onDismissRequest=onDismiss,title={Text("Yeni Site Ekle")},text={Column(verticalArrangement=Arrangement.spacedBy(10.dp)){OutlinedTextField(n,{n=it},label={Text("Site adı")});OutlinedTextField(u,{u=it},label={Text("Site adresi")})}},confirmButton={Button({onAdd(n,u)},enabled=u.isNotBlank()){Text("Kaydet")}},dismissButton={TextButton(onDismiss){Text("İptal")}})}
 
-@Composable fun SettingsScreen(){Column(Modifier.fillMaxSize().padding(20.dp)){Text("Ayarlar",fontSize=28.sp,fontWeight=FontWeight.Bold);Spacer(Modifier.height(16.dp));Text("ScrapeFlix v0.13.0",fontWeight=FontWeight.Bold);Spacer(Modifier.height(8.dp));Text("v0.13: Uygulamanın kendi sabit kategorileri (Film/Dizi/Anime/Belgesel) kaldırıldı. İçerikler artık her sitenin kendi menü/alt menü yapısına göre başlıklandırılıyor. Kartlarda bulunabildiğinde yıl ve puan bilgisi de gösteriliyor.",color=Color.Gray)}}
+@Composable fun SettingsScreen(){Column(Modifier.fillMaxSize().padding(20.dp)){Text("Ayarlar",fontSize=28.sp,fontWeight=FontWeight.Bold);Spacer(Modifier.height(16.dp));Text("ScrapeFlix v0.14.0",fontWeight=FontWeight.Bold);Spacer(Modifier.height(8.dp));Text("v0.14: Tarama artık çok seviyeli — ana menü, onun alt menüleri ve her sayfanın sayfalaması (2., 3. sayfa...) takip ediliyor. İçerikler ekranında her menü başlığının altında yatay kaydırmalı poster satırı var; posterlere dokununca ayrı bir detay kartı (görsel, yıl, puan, özet) açılıyor ve İzle butonuyla oynatma başlıyor.",color=Color.Gray)}}
 
 class MainActivity:ComponentActivity(){override fun onCreate(b:Bundle?){super.onCreate(b);setContent{App()}}}
