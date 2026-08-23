@@ -220,13 +220,36 @@ private fun looksLikeStreamUrl(url: String): Boolean {
         clean.endsWith(".ts") || clean.contains("/manifest") || clean.contains("playlist.m3u8")
 }
 
+/** Sayfa yüklendikten sonra "oynat" düğmesine benzeyen elemanları ve <video> etiketlerini
+ *  tıklayıp/oynatıp gerçek player'ı tetiklemeye çalışan JS. Birçok site akış isteğini
+ *  sayfa yüklenirken değil, kullanıcı play'e bastığında atar — bunu simüle ediyoruz. */
+private const val PLAY_TRIGGER_JS = """
+(function(){
+  try {
+    var vids = document.querySelectorAll('video');
+    for (var i=0;i<vids.length;i++){ try{ vids[i].muted = true; vids[i].play().catch(function(){}); }catch(e){} }
+  } catch(e){}
+  var sels = ['.vjs-big-play-button','.jw-icon-playback','.jwplayer .jw-display-icon-container',
+    '.plyr__control--overlaid','.play-button','.playbtn','[class*=play-btn]','[class*=playBtn]',
+    '[class*=player-play]','[class*=play_button]','[aria-label=Play]','[aria-label=play]',
+    '[aria-label=Oynat]','[title=Play]','[title=Oynat]','[title=oynat]','[id*=play]','[class*=play]'];
+  for (var i=0;i<sels.length;i++){
+    try {
+      var els = document.querySelectorAll(sels[i]);
+      for (var j=0;j<els.length && j<6;j++){ try{ els[j].click(); }catch(e){} }
+    } catch(e){}
+  }
+})();
+"""
+
 /**
  * 1DM benzeri yöntem: sayfayı gizli bir WebView'de gerçekten çalıştırıp (JavaScript dahil),
- * yüklenmeye çalışılan tüm ağ isteklerini dinler ve video/m3u8/mpd uzantılı ilk isteği
- * akış linki olarak yakalar. Statik HTML çekmenin (Jsoup) göremediği, JS ile enjekte edilen
- * player kaynaklarını bulmak için kullanılır.
+ * yükleme bitince "play" düğmesine benzeyen elemanları JS ile tıklayarak player'ı tetikler,
+ * bu sırada atılan tüm ağ isteklerini dinler ve video/m3u8/mpd uzantılı ilk isteği akış linki
+ * olarak yakalar. Statik HTML çekmenin (Jsoup) göremediği, JS ile enjekte edilen ve sadece
+ * play tıklamasıyla başlayan player kaynaklarını bulmak için kullanılır.
  */
-private suspend fun sniffStreamUrlViaWebView(context: Context, pageUrl: String, timeoutMs: Long = 15000L): String? =
+private suspend fun sniffStreamUrlViaWebView(context: Context, pageUrl: String, timeoutMs: Long = 22000L): String? =
     withContext(Dispatchers.Main) {
         suspendCancellableCoroutine { cont ->
             var resolved = false
@@ -255,6 +278,19 @@ private suspend fun sniffStreamUrlViaWebView(context: Context, pageUrl: String, 
                     val url = request.url.toString()
                     if (looksLikeStreamUrl(url)) finish(url)
                     return super.shouldInterceptRequest(view, request)
+                }
+
+                override fun onPageFinished(view: WebView, url: String?) {
+                    super.onPageFinished(view, url)
+                    // Reklam/overlay kapatma + gerçek play butonuna ulaşma ihtimaline karşı
+                    // birden fazla turda "oynat" tıklaması dene.
+                    for (delayMs in longArrayOf(700L, 2200L, 4200L, 7000L, 10000L)) {
+                        handler.postDelayed({
+                            if (!resolved) {
+                                try { view.evaluateJavascript(PLAY_TRIGGER_JS, null) } catch (e: Exception) { /* yok say */ }
+                            }
+                        }, delayMs)
+                    }
                 }
             }
 
@@ -378,7 +414,7 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
         viewModelScope.launch {
             var streamUrl = withContext(Dispatchers.IO) { resolveStreamUrl(item.url) }
             if (streamUrl == null) {
-                message = "Sayfa canlı olarak analiz ediliyor: ${item.title}"
+                message = "Sayfa açılıp oynatma tetikleniyor: ${item.title}"
                 streamUrl = sniffStreamUrlViaWebView(context, item.url)
             }
             streamBusy = false
@@ -725,6 +761,6 @@ fun SiteEditorDialog(
 
 @Composable fun AddSiteDialog(onDismiss:()->Unit,onAdd:(String,String)->Unit){var n by remember{mutableStateOf("")};var u by remember{mutableStateOf("")};AlertDialog(onDismissRequest=onDismiss,title={Text("Yeni Site Ekle")},text={Column(verticalArrangement=Arrangement.spacedBy(10.dp)){OutlinedTextField(n,{n=it},label={Text("Site adı")});OutlinedTextField(u,{u=it},label={Text("Site adresi")})}},confirmButton={Button({onAdd(n,u)},enabled=u.isNotBlank()){Text("Kaydet")}},dismissButton={TextButton(onDismiss){Text("İptal")}})}
 
-@Composable fun SettingsScreen(){Column(Modifier.fillMaxSize().padding(20.dp)){Text("Ayarlar",fontSize=28.sp,fontWeight=FontWeight.Bold);Spacer(Modifier.height(16.dp));Text("ScrapeFlix v0.8.0",fontWeight=FontWeight.Bold);Spacer(Modifier.height(8.dp));Text("v0.8: Görsel yakalamadaki base64 placeholder hatası düzeltildi. Akış linki artık önce statik analizle, bulunamazsa gizli bir WebView'de sayfa gerçekten çalıştırılıp ağ istekleri dinlenerek (1DM tarayıcısına benzer yöntem) bulunuyor.",color=Color.Gray)}}
+@Composable fun SettingsScreen(){Column(Modifier.fillMaxSize().padding(20.dp)){Text("Ayarlar",fontSize=28.sp,fontWeight=FontWeight.Bold);Spacer(Modifier.height(16.dp));Text("ScrapeFlix v0.9.0",fontWeight=FontWeight.Bold);Spacer(Modifier.height(8.dp));Text("v0.9: Akış linki aramada artık 1DM'e benzer şekilde sayfa yüklendikten sonra play düğmesine benzeyen elemanlar ve <video> etiketleri JS ile birkaç turda tıklanıp/oynatılıp gerçek player tetikleniyor, bu sırada atılan ağ istekleri dinleniyor.",color=Color.Gray)}}
 
 class MainActivity:ComponentActivity(){override fun onCreate(b:Bundle?){super.onCreate(b);setContent{App()}}}
