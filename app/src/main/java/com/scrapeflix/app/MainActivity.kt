@@ -213,30 +213,102 @@ private fun resolveStreamUrl(pageUrl: String): String? {
     } catch (e: Exception) { null }
 }
 
-/** Bir URL'in gerçek video/akış kaynağı olma ihtimalini uzantısına göre değerlendirir. */
+/** Bilinen statik varlık uzantıları — bunlar için içerik-tipi sorgusu yapmaya gerek yok
+ *  (performans için, ve yanlış pozitifleri azaltmak için). */
+private val staticAssetExtensions = setOf(
+    "css", "js", "png", "jpg", "jpeg", "gif", "svg", "webp", "woff", "woff2", "ico", "json", "ttf", "eot", "map"
+)
+
+/** Analitik/reklam altyapısı gibi sık geçen ama içerik sorgusuna değmeyecek host'lar. */
+private val skipSniffHostKeywords = listOf(
+    "google-analytics", "googletagmanager", "doubleclick", "facebook.", "fbcdn", "adservice",
+    "adsystem", "gstatic.com", "googlesyndication", "scorecardresearch", "hotjar", "sentry.io",
+    "cloudflareinsights", "yandex", "criteo"
+)
+
+/** Bir URL'in gerçek video/akış kaynağı olma ihtimalini uzantı ve yol kalıplarına göre
+ *  değerlendirir. Bazı siteler akış dosyasını gizlemek için ".txt" gibi sahte uzantılar
+ *  kullanıyor (ör: .../hls/xxx.mp4/txt/sublist_2.txt) — bu yüzden salt uzantı kontrolü
+ *  yetmiyor, klasör/yol kalıplarına da bakılıyor. */
 private fun looksLikeStreamUrl(url: String): Boolean {
     val clean = url.substringBefore('?').lowercase()
-    return clean.endsWith(".m3u8") || clean.endsWith(".mp4") || clean.endsWith(".mpd") ||
-        clean.endsWith(".ts") || clean.contains("/manifest") || clean.contains("playlist.m3u8")
+    if (clean.endsWith(".m3u8") || clean.endsWith(".mp4") || clean.endsWith(".mpd") ||
+        clean.endsWith(".ts") || clean.endsWith(".m4s") || clean.endsWith(".webm")) return true
+    if (clean.contains("/hls/") || clean.contains("/dash/")) return true
+    if (Regex("""\.mp4[/.]""").containsMatchIn(clean)) return true
+    if (listOf("playlist", "sublist", "chunklist", "manifest", "master.m3u8", "index.m3u8").any { clean.contains(it) }) return true
+    return false
 }
 
-/** Sayfa yüklendikten sonra "oynat" düğmesine benzeyen elemanları ve <video> etiketlerini
- *  tıklayıp/oynatıp gerçek player'ı tetiklemeye çalışan JS. Birçok site akış isteğini
- *  sayfa yüklenirken değil, kullanıcı play'e bastığında atar — bunu simüle ediyoruz. */
+private fun shouldSkipContentSniff(url: String): Boolean {
+    val lower = url.lowercase()
+    if (skipSniffHostKeywords.any { lower.contains(it) }) return true
+    val ext = lower.substringBefore('?').substringAfterLast('.', "")
+    return ext in staticAssetExtensions
+}
+
+/** Uzantısı belirsiz/kılık değiştirmiş isteklerde gerçek içerik tipine/gövde imzasına bakar:
+ *  Content-Type video/mpegurl vb. içeriyorsa, veya gövde bir HLS playlist imzasıyla
+ *  (#EXTM3U) başlıyorsa akış kaynağı olarak kabul eder. Sadece ilk birkaç yüz byte okunur. */
+private fun sniffContentLooksLikeStream(url: String, referer: String): Boolean {
+    var conn: java.net.HttpURLConnection? = null
+    return try {
+        conn = (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply {
+            instanceFollowRedirects = true
+            connectTimeout = 4000
+            readTimeout = 4000
+            setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36")
+            setRequestProperty("Referer", referer)
+            setRequestProperty("Range", "bytes=0-600")
+        }
+        conn.connect()
+        val contentType = conn.contentType?.lowercase().orEmpty()
+        val looksVideoType = listOf("mpegurl", "video/", "mp2t", "dash+xml", "x-mpegurl", "octet-stream").any { contentType.contains(it) }
+        var bodyLooksPlaylist = false
+        if (!looksVideoType) {
+            try {
+                val buf = CharArray(400)
+                val len = conn.inputStream.reader().read(buf)
+                val head = if (len > 0) String(buf, 0, len) else ""
+                if (head.trimStart().startsWith("#EXTM3U")) bodyLooksPlaylist = true
+            } catch (e: Exception) { /* okunamadı */ }
+        }
+        looksVideoType || bodyLooksPlaylist
+    } catch (e: Exception) { false } finally {
+        try { conn?.disconnect() } catch (e: Exception) { }
+    }
+}
+
+/** Sayfa yüklendikten sonra "oynat" düğmesine, reklam geçme/kapatma düğmesine benzeyen
+ *  elemanları ve <video> etiketlerini tıklayıp/oynatıp gerçek player'ı ve varsa reklamı
+ *  geçmeyi tetikleyen JS. click/mousedown/mouseup/touch olaylarının hepsini gönderir,
+ *  çünkü bazı player'lar sade "click" yerine bunları dinliyor. */
 private const val PLAY_TRIGGER_JS = """
 (function(){
+  function fire(el){
+    try {
+      ['mousedown','mouseup','click','touchstart','touchend'].forEach(function(type){
+        var ev;
+        try { ev = new MouseEvent(type, {bubbles:true, cancelable:true, view:window}); }
+        catch(e){ ev = document.createEvent('MouseEvent'); ev.initEvent(type, true, true); }
+        el.dispatchEvent(ev);
+      });
+      if (el.click) el.click();
+    } catch(e){}
+  }
   try {
-    var vids = document.querySelectorAll('video');
-    for (var i=0;i<vids.length;i++){ try{ vids[i].muted = true; vids[i].play().catch(function(){}); }catch(e){} }
+    document.querySelectorAll('video').forEach(function(v){ try{ v.muted = true; v.play().catch(function(){}); }catch(e){} });
   } catch(e){}
   var sels = ['.vjs-big-play-button','.jw-icon-playback','.jwplayer .jw-display-icon-container',
     '.plyr__control--overlaid','.play-button','.playbtn','[class*=play-btn]','[class*=playBtn]',
     '[class*=player-play]','[class*=play_button]','[aria-label=Play]','[aria-label=play]',
-    '[aria-label=Oynat]','[title=Play]','[title=Oynat]','[title=oynat]','[id*=play]','[class*=play]'];
+    '[aria-label=Oynat]','[title=Play]','[title=Oynat]','[title=oynat]','[id*=play]','[class*=play]',
+    '[class*=skip]','[class*=atla]','[class*=close-ad]','[class*=closead]','[class*=ad-close]',
+    '[class*=skip-ad]','video'];
   for (var i=0;i<sels.length;i++){
     try {
       var els = document.querySelectorAll(sels[i]);
-      for (var j=0;j<els.length && j<6;j++){ try{ els[j].click(); }catch(e){} }
+      for (var j=0;j<els.length && j<6;j++){ fire(els[j]); }
     } catch(e){}
   }
 })();
@@ -244,17 +316,19 @@ private const val PLAY_TRIGGER_JS = """
 
 /**
  * 1DM benzeri yöntem: sayfayı gizli bir WebView'de gerçekten çalıştırıp (JavaScript dahil),
- * yükleme bitince "play" düğmesine benzeyen elemanları JS ile tıklayarak player'ı tetikler,
- * bu sırada atılan tüm ağ isteklerini dinler ve video/m3u8/mpd uzantılı ilk isteği akış linki
- * olarak yakalar. Statik HTML çekmenin (Jsoup) göremediği, JS ile enjekte edilen ve sadece
- * play tıklamasıyla başlayan player kaynaklarını bulmak için kullanılır.
+ * yükleme bittikten sonra uzun bir süre boyunca tekrar tekrar "oynat"/"reklamı geç" tıklaması
+ * simüle eder (reklamların geçmesi zaman aldığı ve genelde birden fazla tıklama gerektirdiği
+ * için), bu sırada atılan tüm ağ isteklerini dinler. Bilinen video uzantılı/yollu istekleri
+ * anında yakalar; şüpheli ama uzantısı gizlenmiş istekler için gerçek içerik tipine/gövde
+ * imzasına bakar (ör. ".txt" uzantılı ama aslında m3u8 playlist olan dosyalar).
  */
-private suspend fun sniffStreamUrlViaWebView(context: Context, pageUrl: String, timeoutMs: Long = 22000L): String? =
+private suspend fun sniffStreamUrlViaWebView(context: Context, pageUrl: String, timeoutMs: Long = 34000L): String? =
     withContext(Dispatchers.Main) {
         suspendCancellableCoroutine { cont ->
             var resolved = false
             val handler = Handler(Looper.getMainLooper())
             val webView = WebView(context.applicationContext)
+            val sniffExecutor = java.util.concurrent.Executors.newFixedThreadPool(3)
 
             fun finish(url: String?) {
                 handler.post {
@@ -262,6 +336,7 @@ private suspend fun sniffStreamUrlViaWebView(context: Context, pageUrl: String, 
                     resolved = true
                     handler.removeCallbacksAndMessages(null)
                     try { webView.stopLoading(); webView.destroy() } catch (e: Exception) { /* yok say */ }
+                    try { sniffExecutor.shutdownNow() } catch (e: Exception) { }
                     if (cont.isActive) cont.resume(url)
                 }
             }
@@ -276,15 +351,27 @@ private suspend fun sniffStreamUrlViaWebView(context: Context, pageUrl: String, 
             webView.webViewClient = object : WebViewClient() {
                 override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                     val url = request.url.toString()
-                    if (looksLikeStreamUrl(url)) finish(url)
+                    if (!resolved) {
+                        if (looksLikeStreamUrl(url)) {
+                            finish(url)
+                        } else if (!request.isForMainFrame && !shouldSkipContentSniff(url) &&
+                            (url.startsWith("http://") || url.startsWith("https://"))
+                        ) {
+                            // Ağır olmasın diye ayrı bir thread havuzunda, WebView'in kendi
+                            // isteğini engellemeden içerik tipini kontrol et.
+                            sniffExecutor.execute {
+                                if (!resolved && sniffContentLooksLikeStream(url, pageUrl)) finish(url)
+                            }
+                        }
+                    }
                     return super.shouldInterceptRequest(view, request)
                 }
 
                 override fun onPageFinished(view: WebView, url: String?) {
                     super.onPageFinished(view, url)
-                    // Reklam/overlay kapatma + gerçek play butonuna ulaşma ihtimaline karşı
-                    // birden fazla turda "oynat" tıklaması dene.
-                    for (delayMs in longArrayOf(700L, 2200L, 4200L, 7000L, 10000L)) {
+                    // Reklamların geçmesi zaman alabiliyor ve genelde birden fazla tıklama
+                    // gerekiyor; bu yüzden uzun bir pencerede sık aralıklarla tekrar dene.
+                    for (delayMs in longArrayOf(600L, 1500L, 3000L, 5000L, 7500L, 10500L, 14000L, 18000L, 23000L, 29000L)) {
                         handler.postDelayed({
                             if (!resolved) {
                                 try { view.evaluateJavascript(PLAY_TRIGGER_JS, null) } catch (e: Exception) { /* yok say */ }
@@ -296,7 +383,10 @@ private suspend fun sniffStreamUrlViaWebView(context: Context, pageUrl: String, 
 
             handler.postDelayed({ finish(null) }, timeoutMs)
             cont.invokeOnCancellation {
-                handler.post { try { webView.stopLoading(); webView.destroy() } catch (e: Exception) { } }
+                handler.post {
+                    try { webView.stopLoading(); webView.destroy() } catch (e: Exception) { }
+                    try { sniffExecutor.shutdownNow() } catch (e: Exception) { }
+                }
             }
 
             try {
@@ -475,7 +565,7 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
         viewModelScope.launch {
             var streamUrl = withContext(Dispatchers.IO) { resolveStreamUrl(url) }
             if (streamUrl == null) {
-                message = "Sayfa açılıp oynatma tetikleniyor: $title"
+                message = "Sayfa açılıp oynatma/reklam geçme tetikleniyor (biraz sürebilir): $title"
                 streamUrl = sniffStreamUrlViaWebView(context, url)
             }
             streamBusy = false
@@ -855,6 +945,6 @@ fun SiteEditorDialog(
 
 @Composable fun AddSiteDialog(onDismiss:()->Unit,onAdd:(String,String)->Unit){var n by remember{mutableStateOf("")};var u by remember{mutableStateOf("")};AlertDialog(onDismissRequest=onDismiss,title={Text("Yeni Site Ekle")},text={Column(verticalArrangement=Arrangement.spacedBy(10.dp)){OutlinedTextField(n,{n=it},label={Text("Site adı")});OutlinedTextField(u,{u=it},label={Text("Site adresi")})}},confirmButton={Button({onAdd(n,u)},enabled=u.isNotBlank()){Text("Kaydet")}},dismissButton={TextButton(onDismiss){Text("İptal")}})}
 
-@Composable fun SettingsScreen(){Column(Modifier.fillMaxSize().padding(20.dp)){Text("Ayarlar",fontSize=28.sp,fontWeight=FontWeight.Bold);Spacer(Modifier.height(16.dp));Text("ScrapeFlix v0.10.0",fontWeight=FontWeight.Bold);Spacer(Modifier.height(8.dp));Text("v0.10: Dizi/Anime kategorisindeki içeriklere tıklandığında artık önce bölüm listesi gösteriliyor; bir bölüme tıklanınca o bölümün akış linki aranıp uygulama seçtiriliyor.",color=Color.Gray)}}
+@Composable fun SettingsScreen(){Column(Modifier.fillMaxSize().padding(20.dp)){Text("Ayarlar",fontSize=28.sp,fontWeight=FontWeight.Bold);Spacer(Modifier.height(16.dp));Text("ScrapeFlix v0.11.0",fontWeight=FontWeight.Bold);Spacer(Modifier.height(8.dp));Text("v0.11: Akış linki bulma çok daha güçlü: uzantısı gizlenmiş dosyalar (ör. .txt ile maskelenmiş m3u8) içerik imzasına bakılarak yakalanıyor; reklam geçme/oynat tıklamaları artık 34 saniyelik bir pencerede 10 turda tekrarlanıyor.",color=Color.Gray)}}
 
 class MainActivity:ComponentActivity(){override fun onCreate(b:Bundle?){super.onCreate(b);setContent{App()}}}
