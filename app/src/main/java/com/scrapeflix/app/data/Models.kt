@@ -27,5 +27,8 @@ data class ScrapedItemEntity(
     val imageUrl: String? = null,
     val description: String? = null,
     val category: String = "Diğer",
+    val year: String? = null,
+    val rating: String? = null,
+    val sortOrder: Int = 0,
     val scrapedAt: Long = System.currentTimeMillis()
 )

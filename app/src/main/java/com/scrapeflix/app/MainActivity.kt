@@ -113,24 +113,49 @@ private fun Element.guessTitle(): String =
 
 private fun normalizeUrl(url: String) = if (url.trim().startsWith("http://") || url.trim().startsWith("https://")) url.trim() else "https://${url.trim()}"
 
-/** Sitenin nav/menü alanlarındaki alt sayfa linklerini bulur (aynı domain, tekrarsız). */
-private fun discoverSubPages(doc: Document, baseUrl: String, limit: Int = 15): List<String> {
+data class MenuLink(val label: String, val url: String)
+
+/** Sitenin nav/menü alanlarındaki alt sayfa linklerini, görünen menü etiketiyle birlikte bulur
+ *  (aynı domain, tekrarsız). Bu etiket, o alt sayfadan çıkan içeriklerin başlığı olarak
+ *  kullanılacak — uygulama kendi kategorilerini uydurmuyor, sitenin kendi menüsünü yansıtıyor. */
+private fun discoverSubPages(doc: Document, baseUrl: String, limit: Int = 15): List<MenuLink> {
     val baseHost = try { java.net.URI(baseUrl).host } catch (e: Exception) { null } ?: return emptyList()
     val base = baseUrl.trimEnd('/')
     return doc.select("nav a[href], header a[href], [class*=menu] a[href], [class*=nav] a[href], [class*=categor] a[href], [id*=menu] a[href], [id*=nav] a[href]")
-        .mapNotNull { a -> a.absUrl("href").trim().ifBlank { null } }
-        .filter { href ->
-            href.startsWith("http") &&
-                href.trimEnd('/') != base &&
-                !href.contains("#") &&
-                (try { java.net.URI(href).host } catch (e: Exception) { null }) == baseHost
+        .mapNotNull { a ->
+            val href = a.absUrl("href").trim()
+            val label = a.text().trim()
+            if (href.isBlank() || label.isBlank() || label.length > 40) return@mapNotNull null
+            if (!href.startsWith("http") || href.trimEnd('/') == base || href.contains("#")) return@mapNotNull null
+            if ((try { java.net.URI(href).host } catch (e: Exception) { null }) != baseHost) return@mapNotNull null
+            MenuLink(label, href)
         }
-        .distinct()
+        .distinctBy { it.url }
         .take(limit)
 }
 
-/** Verilen bir HTML dokümanından, sitenin selector'larına göre içerik kartlarını çıkarır. */
-private fun extractItems(doc: Document, site: SiteEntity): List<ScrapedItemEntity> {
+private val yearRegex = Regex("""(19|20)\d{2}""")
+
+/** Kartın içindeki metinden yıl bilgisini yakalamaya çalışır: önce yıl/tarih benzeri
+ *  class'lara bakar, bulamazsa kartın tüm metninde 4 haneli bir yıl arar. */
+private fun Element.guessYear(): String? {
+    selectFirst("[class*=year], [class*=yil], [class*=tarih], [class*=date]")?.text()?.let { t ->
+        yearRegex.find(t)?.value?.let { return it }
+    }
+    return yearRegex.find(text())?.value
+}
+
+/** Kartın içindeki puan/imdb/rating benzeri class'lardan kısa bir metin yakalamaya çalışır. */
+private fun Element.guessRating(): String? {
+    val el = selectFirst("[class*=rating], [class*=puan], [class*=imdb], [class*=score], [class*=oy]") ?: return null
+    val t = el.text().trim()
+    return t.takeIf { it.isNotBlank() && it.length <= 12 }
+}
+
+/** Verilen bir HTML dokümanından, sitenin selector'larına göre içerik kartlarını çıkarır.
+ *  categoryLabel, bu sayfanın hangi site menüsünden geldiğini belirtir (uygulamanın kendi
+ *  kategorisi değil, sitenin kendi menü adı). */
+private fun extractItems(doc: Document, site: SiteEntity, categoryLabel: String): List<ScrapedItemEntity> {
     val selector = site.itemSelector.ifBlank { "article, .card, .item" }
     return doc.select(selector).mapNotNull { el ->
         val link = if (el.tagName() == "a") el else el.selectFirst(site.linkSelector.ifBlank { "a[href]" })
@@ -139,17 +164,11 @@ private fun extractItems(doc: Document, site: SiteEntity): List<ScrapedItemEntit
             ?.text()?.trim().takeUnless { it.isNullOrBlank() } ?: link?.text()?.trim().orEmpty()
         val image = el.selectFirst(site.imageSelector.ifBlank { "img" })?.let { it.bestImage() }
         val desc = el.selectFirst(site.descriptionSelector.ifBlank { "p,[class*=description],[class*=summary]" })?.text()?.trim()
-        if (title.length < 2) null else ScrapedItemEntity(siteId = site.id, title = title, url = href, imageUrl = image, description = desc?.ifBlank { null }, category = guessCategoryStatic(title, href))
-    }
-}
-
-private fun guessCategoryStatic(title: String, url: String): String {
-    val s = (title + " " + url).lowercase(Locale.getDefault())
-    return when {
-        listOf("anime", "episode", "ova").any { s.contains(it) } -> "Anime"
-        listOf("series", "season", "dizi").any { s.contains(it) } -> "Dizi"
-        listOf("documentary", "belgesel").any { s.contains(it) } -> "Belgesel"
-        else -> "Film"
+        if (title.length < 2) null else ScrapedItemEntity(
+            siteId = site.id, title = title, url = href, imageUrl = image,
+            description = desc?.ifBlank { null }, category = categoryLabel.ifBlank { "Diğer" },
+            year = el.guessYear(), rating = el.guessRating()
+        )
     }
 }
 
@@ -532,14 +551,12 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
 
     fun select(site: SiteEntity) { selectedSiteId = site.id }
 
-    /** İçerik kartına tıklandığında çağrılır: dizi/anime ise önce bölüm listesini gösterir,
-     *  film/belgesel gibi tek parçalı içeriklerde doğrudan akış linkini arar. */
-    fun openItem(context: Context, item: ScrapedItemEntity) {
-        if (item.category == "Dizi" || item.category == "Anime") loadEpisodes(context, item)
-        else openStream(context, item)
-    }
+    /** İçerik kartına tıklandığında çağrılır. Kategori artık sitenin kendi menü adı olduğu
+     *  için (Film/Dizi gibi sabit bir sözlük yok), her tıklamada önce sayfada bölüm linki
+     *  var mı diye bakılır; yoksa (tek parçalı içerik) doğrudan akış linkine düşülür. */
+    fun openItem(context: Context, item: ScrapedItemEntity) = loadEpisodes(context, item)
 
-    /** Dizi/anime detay sayfasını tarayıp bölüm linklerini bulur ve diyalogda gösterir.
+    /** Detay sayfasını tarayıp bölüm linklerini bulur ve diyalogda gösterir.
      *  Hiç bölüm bulunamazsa (aslında tek parçalık bir sayfaysa) doğrudan akış linkine düşer. */
     fun loadEpisodes(context: Context, item: ScrapedItemEntity) {
         if (episodesBusy) return
@@ -638,27 +655,37 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
         if (busy) return; busy = true; selectedSiteId = site.id; message = "Ana sayfa taranıyor..."
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val mainDoc = Jsoup.connect(site.url).userAgent("Mozilla/5.0 (Android) ScrapeFlix/0.6").timeout(20000).followRedirects(true).get()
+                val mainDoc = Jsoup.connect(site.url).userAgent("Mozilla/5.0 (Android) ScrapeFlix/0.13").timeout(20000).followRedirects(true).get()
                 val subPages = discoverSubPages(mainDoc, site.url)
-                withContext(Dispatchers.Main) { message = if (subPages.isNotEmpty()) "${subPages.size} alt menü bulundu, taranıyor..." else "Alt menü bulunamadı, ana sayfa taranıyor..." }
-                val allDocs = mutableListOf(mainDoc)
-                if (subPages.isNotEmpty()) {
+                withContext(Dispatchers.Main) { message = if (subPages.isNotEmpty()) "${subPages.size} menü bulundu, taranıyor..." else "Menü bulunamadı, ana sayfa taranıyor..." }
+
+                val fetchedSubPages: List<Pair<MenuLink, Document>> = if (subPages.isNotEmpty()) {
                     val semaphore = Semaphore(4)
-                    val fetched = subPages.map { link ->
+                    subPages.map { link ->
                         async {
                             semaphore.withPermit {
                                 try {
-                                    Jsoup.connect(link).userAgent("Mozilla/5.0 (Android) ScrapeFlix/0.6").timeout(12000).followRedirects(true).get()
+                                    link to Jsoup.connect(link.url).userAgent("Mozilla/5.0 (Android) ScrapeFlix/0.13").timeout(12000).followRedirects(true).get()
                                 } catch (e: Exception) { null }
                             }
                         }
-                    }.awaitAll()
-                    allDocs.addAll(fetched.filterNotNull())
+                    }.awaitAll().filterNotNull()
+                } else emptyList()
+
+                // Alt menü sayfaları önce işlenir ki bir içerik birden fazla yerde görünüyorsa
+                // (ör. hem anasayfada hem bir menüde) sitenin gerçek menü adı kazansın; anasayfa
+                // içerikleri en son eklenir ve sadece hiçbir menüde geçmeyenler "Ana Sayfa" alır.
+                val found = mutableListOf<ScrapedItemEntity>()
+                var order = 0
+                for ((link, doc) in fetchedSubPages) {
+                    extractItems(doc, site, link.label).forEach { found += it.copy(sortOrder = order++) }
                 }
-                val found = allDocs.flatMap { extractItems(it, site) }.distinctBy { it.url }.take(500)
-                db.itemDao().deleteForSite(site.id); if (found.isNotEmpty()) db.itemDao().insertAll(found)
-                db.siteDao().update(site.copy(lastUpdated=System.currentTimeMillis(),itemCount=found.size,profileStatus="Aktif"))
-                withContext(Dispatchers.Main) { message="${allDocs.size} sayfa tarandı, ${found.size} içerik bulundu."; busy=false }
+                extractItems(mainDoc, site, "Ana Sayfa").forEach { found += it.copy(sortOrder = order++) }
+
+                val deduped = found.distinctBy { it.url }.take(800)
+                db.itemDao().deleteForSite(site.id); if (deduped.isNotEmpty()) db.itemDao().insertAll(deduped)
+                db.siteDao().update(site.copy(lastUpdated=System.currentTimeMillis(),itemCount=deduped.size,profileStatus="Aktif"))
+                withContext(Dispatchers.Main) { message = "${fetchedSubPages.size + 1} sayfa tarandı, ${deduped.size} içerik bulundu."; busy = false }
             } catch (e: Exception) { withContext(Dispatchers.Main) { message="Tarama başarısız: ${e.message ?: "Bilinmeyen hata"}"; busy=false } }
         }
     }
@@ -701,12 +728,24 @@ enum class Page { Home, Sites, Watch, Settings }
     val sites by vm.sites.collectAsState()
     val context = LocalContext.current
     var q by remember { mutableStateOf("") }
-    var cat by remember { mutableStateOf("Tümü") }
     val filterSiteId = vm.watchFilterSiteId
-    val filtered = items.filter {
-        (filterSiteId == null || it.siteId == filterSiteId) &&
-            (q.isBlank() || it.title.contains(q, true)) &&
-            (cat == "Tümü" || it.category == cat)
+    val base = items.filter {
+        (filterSiteId == null || it.siteId == filterSiteId) && (q.isBlank() || it.title.contains(q, true))
+    }
+    // Uygulamanın kendi sabit kategorileri yok: her bölüm başlığı doğrudan sitenin kendi
+    // menüsünden geliyor (item.category = o menünün görünen adı). Tek site seçiliyken
+    // doğrudan o sitenin menü yapısı gösterilir; "Tümü"de önce site adına, sonra o sitenin
+    // kendi menüsüne göre gruplanır.
+    val siteNameById = remember(sites) { sites.associateBy({ it.id }, { it.name }) }
+    data class Section(val header: String, val list: List<ScrapedItemEntity>)
+    val sections: List<Section> = remember(base, filterSiteId, siteNameById) {
+        if (filterSiteId != null) {
+            base.groupBy { it.category }.map { (cat, list) -> Section(cat, list) }
+        } else {
+            base.groupBy { siteNameById[it.siteId] ?: "Bilinmeyen Site" }.flatMap { (siteName, siteItems) ->
+                siteItems.groupBy { it.category }.map { (cat, list) -> Section("$siteName · $cat", list) }
+            }
+        }
     }
     Column(Modifier.fillMaxSize().padding(16.dp)) {
         Text("İçerikler", fontSize = 28.sp, fontWeight = FontWeight.Bold)
@@ -726,44 +765,24 @@ enum class Page { Home, Sites, Watch, Settings }
         Spacer(Modifier.height(10.dp))
         OutlinedTextField(q, { q = it }, Modifier.fillMaxWidth(), label = { Text("İçerik ara") })
         Spacer(Modifier.height(8.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            listOf("Tümü", "Film", "Dizi", "Anime", "Belgesel").forEach {
-                FilterChip(selected = cat == it, onClick = { cat = it }, label = { Text(it) })
-            }
-        }
-        Spacer(Modifier.height(8.dp))
         if (vm.streamBusy || vm.episodesBusy) LinearProgressIndicator(Modifier.fillMaxWidth())
         if (vm.message.isNotBlank()) Text(vm.message, color = Color.LightGray, fontSize = 12.sp, modifier = Modifier.padding(vertical = 4.dp))
         Spacer(Modifier.height(2.dp))
-        if (filtered.isEmpty()) Text("Sonuç bulunamadı.", color = Color.Gray) else LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            items(filtered) { item ->
-                Card(
-                    modifier = Modifier.fillMaxWidth().clickable { vm.openItem(context, item) },
-                    colors = CardDefaults.cardColors(containerColor = Color(0xFF191919))
-                ) {
-                    Row(Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
-                        if (!item.imageUrl.isNullOrBlank()) {
-                            AsyncImage(
-                                model = coil.request.ImageRequest.Builder(context)
-                                    .data(item.imageUrl)
-                                    .addHeader("User-Agent", "Mozilla/5.0 (Android) ScrapeFlix/0.7")
-                                    .addHeader("Referer", refererFor(item.url))
-                                    .crossfade(true)
-                                    .build(),
-                                contentDescription = item.title,
-                                contentScale = androidx.compose.ui.layout.ContentScale.Crop,
-                                modifier = Modifier.size(90.dp, 70.dp).clip(RoundedCornerShape(6.dp))
-                            )
-                            Spacer(Modifier.width(10.dp))
-                        }
-                        Column {
-                            Text(item.title, fontWeight = FontWeight.Bold, maxLines = 2)
-                            Text(item.category, color = Color.Gray, fontSize = 12.sp)
-                            item.description?.let { Text(it, color = Color.Gray, maxLines = 2, fontSize = 12.sp) }
-                        }
-                    }
+        if (sections.isEmpty()) Text("Sonuç bulunamadı. Bir siteyi tarayarak başlayabilirsin.", color = Color.Gray)
+        else LazyColumn(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            sections.forEach { section ->
+                item(key = "hdr-${section.header}") {
+                    Text(
+                        section.header,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 15.sp,
+                        color = Color(0xFFE50914),
+                        modifier = Modifier.padding(top = 12.dp, bottom = 6.dp)
+                    )
                 }
+                items(section.list, key = { it.id }) { it2 -> ContentItemCard(vm, context, it2) }
             }
+            item { Spacer(Modifier.height(12.dp)) }
         }
     }
     vm.episodeParent?.let { parent ->
@@ -798,6 +817,42 @@ enum class Page { Home, Sites, Watch, Settings }
                 }
             }
         )
+    }
+}
+
+@Composable
+private fun ContentItemCard(vm: ScrapeViewModel, context: Context, item: ScrapedItemEntity) {
+    Card(
+        modifier = Modifier.fillMaxWidth().clickable { vm.openItem(context, item) },
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF191919))
+    ) {
+        Row(Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+            if (!item.imageUrl.isNullOrBlank()) {
+                AsyncImage(
+                    model = coil.request.ImageRequest.Builder(context)
+                        .data(item.imageUrl)
+                        .addHeader("User-Agent", "Mozilla/5.0 (Android) ScrapeFlix/0.13")
+                        .addHeader("Referer", refererFor(item.url))
+                        .crossfade(true)
+                        .build(),
+                    contentDescription = item.title,
+                    contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+                    modifier = Modifier.size(90.dp, 70.dp).clip(RoundedCornerShape(6.dp))
+                )
+                Spacer(Modifier.width(10.dp))
+            }
+            Column {
+                Text(item.title, fontWeight = FontWeight.Bold, maxLines = 2)
+                if (item.year != null || item.rating != null) {
+                    Row {
+                        item.year?.let { Text(it, color = Color(0xFFD4AF37), fontSize = 12.sp, fontWeight = FontWeight.SemiBold) }
+                        if (item.year != null && item.rating != null) Text(" • ", color = Color.Gray, fontSize = 12.sp)
+                        item.rating?.let { Text("★ $it", color = Color(0xFFD4AF37), fontSize = 12.sp, fontWeight = FontWeight.SemiBold) }
+                    }
+                }
+                item.description?.let { Text(it, color = Color.Gray, maxLines = 2, fontSize = 12.sp) }
+            }
+        }
     }
 }
 
@@ -976,6 +1031,6 @@ fun SiteEditorDialog(
 
 @Composable fun AddSiteDialog(onDismiss:()->Unit,onAdd:(String,String)->Unit){var n by remember{mutableStateOf("")};var u by remember{mutableStateOf("")};AlertDialog(onDismissRequest=onDismiss,title={Text("Yeni Site Ekle")},text={Column(verticalArrangement=Arrangement.spacedBy(10.dp)){OutlinedTextField(n,{n=it},label={Text("Site adı")});OutlinedTextField(u,{u=it},label={Text("Site adresi")})}},confirmButton={Button({onAdd(n,u)},enabled=u.isNotBlank()){Text("Kaydet")}},dismissButton={TextButton(onDismiss){Text("İptal")}})}
 
-@Composable fun SettingsScreen(){Column(Modifier.fillMaxSize().padding(20.dp)){Text("Ayarlar",fontSize=28.sp,fontWeight=FontWeight.Bold);Spacer(Modifier.height(16.dp));Text("ScrapeFlix v0.12.0",fontWeight=FontWeight.Bold);Spacer(Modifier.height(8.dp));Text("v0.12: İçerikler artık siteye göre filtrelenebiliyor (Sitelerim'den 'İçerikleri Gör' veya İçerikler ekranındaki site çipleri). Akış linki bulunduğunda artık her zaman video MIME tipiyle açılıyor, böylece tarayıcıya değil cihazdaki video oynatıcılara yönlendiriliyor.",color=Color.Gray)}}
+@Composable fun SettingsScreen(){Column(Modifier.fillMaxSize().padding(20.dp)){Text("Ayarlar",fontSize=28.sp,fontWeight=FontWeight.Bold);Spacer(Modifier.height(16.dp));Text("ScrapeFlix v0.13.0",fontWeight=FontWeight.Bold);Spacer(Modifier.height(8.dp));Text("v0.13: Uygulamanın kendi sabit kategorileri (Film/Dizi/Anime/Belgesel) kaldırıldı. İçerikler artık her sitenin kendi menü/alt menü yapısına göre başlıklandırılıyor. Kartlarda bulunabildiğinde yıl ve puan bilgisi de gösteriliyor.",color=Color.Gray)}}
 
 class MainActivity:ComponentActivity(){override fun onCreate(b:Bundle?){super.onCreate(b);setContent{App()}}}

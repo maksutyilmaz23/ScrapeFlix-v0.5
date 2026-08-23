@@ -14,9 +14,9 @@ interface SiteDao {
 
 @Dao
 interface ItemDao {
-    @Query("SELECT * FROM scraped_items WHERE siteId = :siteId ORDER BY title COLLATE NOCASE")
+    @Query("SELECT * FROM scraped_items WHERE siteId = :siteId ORDER BY category COLLATE NOCASE, sortOrder")
     fun observeForSite(siteId: Long): Flow<List<ScrapedItemEntity>>
-    @Query("SELECT * FROM scraped_items ORDER BY title COLLATE NOCASE")
+    @Query("SELECT * FROM scraped_items ORDER BY category COLLATE NOCASE, sortOrder")
     fun observeAll(): Flow<List<ScrapedItemEntity>>
     @Insert suspend fun insertAll(items: List<ScrapedItemEntity>)
     @Query("DELETE FROM scraped_items WHERE siteId = :siteId") suspend fun deleteForSite(siteId: Long)
