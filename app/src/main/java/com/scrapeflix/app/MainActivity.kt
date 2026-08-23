@@ -711,9 +711,9 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
                     pageBudget -= batch.size
 
                     val nextLevel = mutableListOf<Pair<MenuLink, Int>>()
-                    for ((link, d, doc0) in results) {
-                        if (doc0 == null) continue
-                        var page = doc0
+                    for ((link, d, docMaybe) in results) {
+                        val doc0: Document = docMaybe ?: continue
+                        var page: Document = doc0
                         extractItems(page, site, link.label).forEach { found += it.copy(sortOrder = order++) }
                         pagesScanned++
 
