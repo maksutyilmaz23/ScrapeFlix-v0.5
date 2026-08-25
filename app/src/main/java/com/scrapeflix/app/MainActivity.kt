@@ -119,7 +119,59 @@ private fun normalizeUrl(url: String) = if (url.trim().startsWith("http://") || 
 
 data class MenuLink(val label: String, val url: String)
 
-private fun normalizeUrlKey(url: String): String = url.substringBefore('#').trimEnd('/')
+private val trackingQueryKeys = setOf("utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "fbclid", "gclid", "ref", "utm_id")
+
+/** URL'yi tekrar taramaları engellemek için normalize eder: host küçük harfe çevrilir,
+ *  sondaki "/" atılır, fragment (#) yok sayılır, bilinen izleyici (tracking) query
+ *  parametreleri (utm_*, fbclid vb.) elenir ve kalan parametreler sıralanır — böylece
+ *  aynı sayfaya farklı sıra/izleyici parametreleriyle giden URL'ler aynı anahtara düşer. */
+private fun normalizeUrlKey(url: String): String {
+    return try {
+        val u = java.net.URI(url.substringBefore('#'))
+        val host = (u.host ?: "").lowercase(Locale.getDefault())
+        val path = (u.path ?: "").let { if (it.length > 1) it.trimEnd('/') else it }
+        val query = u.rawQuery?.split("&")
+            ?.filter { it.isNotBlank() && it.substringBefore('=').lowercase(Locale.getDefault()) !in trackingQueryKeys }
+            ?.sorted()
+            ?.joinToString("&")
+        buildString { append(host); append(path); if (!query.isNullOrBlank()) { append('?'); append(query) } }
+    } catch (e: Exception) { url.substringBefore('#').trimEnd('/') }
+}
+
+/** Bir dokümanda <link rel="canonical"> belirtilmişse onu döndürür, yoksa verilen URL'i. */
+private fun canonicalOf(doc: Document, fallback: String): String =
+    doc.selectFirst("link[rel=canonical]")?.absUrl("href")?.takeUnless { it.isBlank() } ?: fallback
+
+/** robots.txt'i çekip "User-agent: *" bloğundaki Disallow yollarını basitçe çıkarır. */
+private fun fetchRobotsDisallowRules(siteUrl: String): List<String> {
+    return try {
+        val origin = java.net.URI(siteUrl).let { "${it.scheme}://${it.host}" }
+        val txt = Jsoup.connect("$origin/robots.txt")
+            .userAgent("Mozilla/5.0 (Android) ScrapeFlix/0.16")
+            .timeout(8000).ignoreContentType(true).get().body().text()
+        val disallows = mutableListOf<String>()
+        var inWildcardBlock = false
+        for (raw in txt.lines()) {
+            val line = raw.trim()
+            if (line.isBlank() || line.startsWith("#")) continue
+            val lower = line.lowercase(Locale.getDefault())
+            when {
+                lower.startsWith("user-agent:") -> inWildcardBlock = line.substringAfter(":").trim() == "*"
+                lower.startsWith("disallow:") && inWildcardBlock -> {
+                    val path = line.substringAfter(":").trim()
+                    if (path.isNotBlank()) disallows += path
+                }
+            }
+        }
+        disallows
+    } catch (e: Exception) { emptyList() }
+}
+
+private fun isAllowedByRobots(url: String, disallowRules: List<String>): Boolean {
+    if (disallowRules.isEmpty()) return true
+    val path = try { java.net.URI(url).path ?: "/" } catch (e: Exception) { "/" }
+    return disallowRules.none { rule -> rule.isNotBlank() && path.startsWith(rule) }
+}
 
 /** Bir listeleme/menü sayfasında "sonraki sayfa" (sayfalama) linkini bulmaya çalışır. */
 private fun findNextPageUrl(doc: Document, baseUrl: String): String? {
@@ -758,31 +810,40 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
     }
 
     fun scrape(site: SiteEntity) {
-        if (busy) return; busy = true; selectedSiteId = site.id; message = "Ana sayfa taranıyor..."
+        if (busy) return; busy = true; selectedSiteId = site.id; message = "robots.txt kontrol ediliyor..."
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val ua = "Mozilla/5.0 (Android) ScrapeFlix/0.15"
-                suspend fun fetch(url: String): Document? = try {
-                    Jsoup.connect(url).userAgent(ua).timeout(12000).followRedirects(true).get()
-                } catch (e: Exception) { null }
+                val ua = "Mozilla/5.0 (Android) ScrapeFlix/0.16"
+                val disallowRules = fetchRobotsDisallowRules(site.url)
+
+                suspend fun fetch(url: String): Document? {
+                    if (!isAllowedByRobots(url, disallowRules)) return null
+                    return try { Jsoup.connect(url).userAgent(ua).timeout(12000).followRedirects(true).get() } catch (e: Exception) { null }
+                }
 
                 val visited = mutableSetOf<String>()
                 val found = mutableListOf<ScrapedItemEntity>()
                 var order = 0
-                var pageBudget = 500 // toplam sayfa isteği bütçesi (site sonsuz sayfalıysa taramayı sınırlar)
-                val maxDepth = 2 // 1: ana menü, 2: onun alt menüsü
+                var pageBudget = 800 // toplam sayfa isteği bütçesi (site sonsuz sayfalıysa/döngülüyse taramayı sınırlar)
+                val maxDepth = 8 // ana menü → alt menü → alt kategori → ... (pratikte siteler bu kadar derinleşmez)
                 val semaphore = Semaphore(4)
                 var pagesScanned = 0
+                var failedFetches = 0
                 val startTime = System.currentTimeMillis()
-                val maxDurationMs = 6 * 60_000L // güvenlik sınırı: 6 dakika
+                val maxDurationMs = 8 * 60_000L // güvenlik sınırı: 8 dakika
                 fun timeLeft() = System.currentTimeMillis() - startTime < maxDurationMs
 
+                withContext(Dispatchers.Main) { message = "Ana sayfa taranıyor..." }
                 visited.add(normalizeUrlKey(site.url))
+                if (!isAllowedByRobots(site.url, disallowRules)) throw Exception("robots.txt ana sayfayı taramaya izin vermiyor")
                 val mainDoc = Jsoup.connect(site.url).userAgent(ua).timeout(20000).followRedirects(true).get()
+                visited.add(normalizeUrlKey(canonicalOf(mainDoc, site.url)))
                 pagesScanned++
 
-                val level1 = discoverSubPages(mainDoc, site.url).filter { visited.add(normalizeUrlKey(it.url)) }
-                withContext(Dispatchers.Main) { message = if (level1.isNotEmpty()) "${level1.size} menü bulundu, taranıyor..." else "Menü bulunamadı, ana sayfa taranıyor..." }
+                val level1 = discoverSubPages(mainDoc, site.url)
+                    .filter { isAllowedByRobots(it.url, disallowRules) }
+                    .filter { visited.add(normalizeUrlKey(it.url)) }
+                withContext(Dispatchers.Main) { message = if (level1.isNotEmpty()) "${level1.size} ana menü bulundu, hiyerarşik tarama başlıyor..." else "Menü bulunamadı, ana sayfa taranıyor..." }
 
                 var currentLevel = level1.map { MenuLink(it.label, it.url) to 1 }
                 var depth = 1
@@ -795,18 +856,24 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
 
                     val nextLevel = mutableListOf<Pair<MenuLink, Int>>()
                     for ((link, d, docMaybe) in results) {
-                        val doc0: Document = docMaybe ?: continue
+                        if (docMaybe == null) { failedFetches++; continue }
+                        val doc0: Document = docMaybe
+                        visited.add(normalizeUrlKey(canonicalOf(doc0, link.url)))
                         var page: Document = doc0
                         extractItems(page, site, link.label).forEach { found += it.copy(sortOrder = order++) }
                         pagesScanned++
 
-                        // Bu menünün TÜM sayfalamasını (2., 3., ... son sayfaya kadar) takip et —
-                        // tek sınır kalan bütçe ve genel zaman güvenliği.
+                        // Bu menü/kategorinin TÜM sayfalamasını (2., 3., ... yeni benzersiz sayfa
+                        // kalmayana kadar) takip et — tek sınır kalan bütçe ve genel zaman güvenliği.
                         while (pageBudget > 0 && timeLeft()) {
                             val nextUrl = findNextPageUrl(page, link.url) ?: break
+                            if (!isAllowedByRobots(nextUrl, disallowRules)) break
                             if (!visited.add(normalizeUrlKey(nextUrl))) break
-                            val nextDoc = fetch(nextUrl) ?: break
-                            pageBudget--; pagesScanned++
+                            val nextDoc = fetch(nextUrl)
+                            pageBudget--
+                            if (nextDoc == null) { failedFetches++; break }
+                            pagesScanned++
+                            visited.add(normalizeUrlKey(canonicalOf(nextDoc, nextUrl)))
                             extractItems(nextDoc, site, link.label).forEach { found += it.copy(sortOrder = order++) }
                             page = nextDoc
                             if (pagesScanned % 5 == 0) {
@@ -814,16 +881,18 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
                             }
                         }
 
-                        // Bu sayfanın kendi alt menüsünü keşfet (bir sonraki derinlik için).
+                        // Bu sayfanın kendi alt menüsünü/alt kategorisini keşfet (bir sonraki derinlik).
                         if (d < maxDepth) {
-                            discoverSubPages(doc0, link.url).forEach { child ->
-                                if (visited.add(normalizeUrlKey(child.url))) {
-                                    nextLevel += MenuLink("${link.label} · ${child.label}", child.url) to (d + 1)
+                            discoverSubPages(doc0, link.url)
+                                .filter { isAllowedByRobots(it.url, disallowRules) }
+                                .forEach { child ->
+                                    if (visited.add(normalizeUrlKey(child.url))) {
+                                        nextLevel += MenuLink("${link.label} · ${child.label}", child.url) to (d + 1)
+                                    }
                                 }
-                            }
                         }
                     }
-                    withContext(Dispatchers.Main) { message = "$pagesScanned sayfa tarandı, devam ediliyor..." }
+                    withContext(Dispatchers.Main) { message = "$pagesScanned sayfa tarandı (derinlik $depth), devam ediliyor..." }
                     currentLevel = nextLevel
                     depth++
                 }
@@ -836,7 +905,11 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
                 val deduped = found.distinctBy { it.url }.take(5000)
                 db.itemDao().deleteForSite(site.id); if (deduped.isNotEmpty()) db.itemDao().insertAll(deduped)
                 db.siteDao().update(site.copy(lastUpdated=System.currentTimeMillis(),itemCount=deduped.size,profileStatus="Aktif"))
-                withContext(Dispatchers.Main) { message = "$pagesScanned sayfa tarandı, ${deduped.size} içerik bulundu."; busy = false }
+                withContext(Dispatchers.Main) {
+                    val failNote = if (failedFetches > 0) ", $failedFetches sayfa erişilemedi" else ""
+                    message = "$pagesScanned sayfa tarandı$failNote, ${deduped.size} içerik bulundu."
+                    busy = false
+                }
             } catch (e: Exception) { withContext(Dispatchers.Main) { message="Tarama başarısız: ${e.message ?: "Bilinmeyen hata"}"; busy=false } }
         }
     }
@@ -1305,6 +1378,6 @@ fun SiteEditorDialog(
 
 @Composable fun AddSiteDialog(onDismiss:()->Unit,onAdd:(String,String)->Unit){var n by remember{mutableStateOf("")};var u by remember{mutableStateOf("")};AlertDialog(onDismissRequest=onDismiss,title={Text("Yeni Site Ekle")},text={Column(verticalArrangement=Arrangement.spacedBy(10.dp)){OutlinedTextField(n,{n=it},label={Text("Site adı")});OutlinedTextField(u,{u=it},label={Text("Site adresi")})}},confirmButton={Button({onAdd(n,u)},enabled=u.isNotBlank()){Text("Kaydet")}},dismissButton={TextButton(onDismiss){Text("İptal")}})}
 
-@Composable fun SettingsScreen(){Column(Modifier.fillMaxSize().padding(20.dp)){Text("Ayarlar",fontSize=28.sp,fontWeight=FontWeight.Bold);Spacer(Modifier.height(16.dp));Text("ScrapeFlix v0.15.0",fontWeight=FontWeight.Bold);Spacer(Modifier.height(8.dp));Text("v0.15: Tarama artık her menünün TÜM sayfalarını (sayfalama) takip ediyor, sabit sayfa sınırı yok. Detay kartı açılınca özet/yıl/puan sayfadan otomatik aranıyor. İzle artık tek link açmıyor — bulunan TÜM akış linklerini (varsa canlı yayın dahil) listeleyip seçim yaptırıyor. İçerikler sırasını isim/yıl/puana göre değiştirebilirsin.",color=Color.Gray)}}
+@Composable fun SettingsScreen(){Column(Modifier.fillMaxSize().padding(20.dp)){Text("Ayarlar",fontSize=28.sp,fontWeight=FontWeight.Bold);Spacer(Modifier.height(16.dp));Text("ScrapeFlix v0.16.0",fontWeight=FontWeight.Bold);Spacer(Modifier.height(8.dp));Text("v0.16: Tarama artık robots.txt kurallarına uyuyor, canonical URL'leri tekrar taramayı önlemek için kullanıyor, menü/kategori hiyerarşisini 2 seviyeyle sınırlı değil (pratikte site ne kadar derinse) takip ediyor ve erişilemeyen sayfalarda durmadan devam ediyor.",color=Color.Gray)}}
 
 class MainActivity:ComponentActivity(){override fun onCreate(b:Bundle?){super.onCreate(b);setContent{App()}}}
