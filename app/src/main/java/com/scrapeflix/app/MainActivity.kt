@@ -236,32 +236,83 @@ private fun refererFor(url: String): String = try {
 
 private val streamUrlRegex = Regex("""https?://[^\s"'<>\\]+\.(m3u8|mp4|mpd)(\?[^\s"'<>\\]*)?""", RegexOption.IGNORE_CASE)
 
-/** İçerik detay sayfasını analiz ederek gerçek video/akış linkini bulmaya çalışır. */
-private fun resolveStreamUrl(pageUrl: String): String? {
+data class StreamCandidate(val label: String, val url: String)
+data class PageAnalysis(val description: String?, val year: String?, val rating: String?, val candidates: List<StreamCandidate>)
+
+private fun guessStreamLabel(url: String, index: Int): String {
+    val lower = url.lowercase()
+    return when {
+        lower.contains("canli") || lower.contains("live") -> "Canlı Yayın"
+        lower.contains("1080") -> "1080p"
+        lower.contains("720") -> "720p"
+        lower.contains("480") -> "480p"
+        lower.contains("360") -> "360p"
+        lower.endsWith(".m3u8") || lower.contains("/hls/") -> "HLS Akışı ${index + 1}"
+        lower.endsWith(".mp4") -> "MP4 ${index + 1}"
+        else -> "Akış Linki ${index + 1}"
+    }
+}
+
+/** İçerik sayfasını tek seferde analiz eder: özet, yıl, puan ve bulunabilen TÜM akış linki
+ *  adaylarını (birden fazla sunucu/kalite seçeneği olabilir) birlikte döndürür. */
+private fun analyzePage(pageUrl: String): PageAnalysis {
     return try {
-        val doc = Jsoup.connect(pageUrl).userAgent("Mozilla/5.0 (Android) ScrapeFlix/0.7").timeout(15000).followRedirects(true).get()
+        val doc = Jsoup.connect(pageUrl).userAgent("Mozilla/5.0 (Android) ScrapeFlix/0.15").timeout(15000).followRedirects(true).get()
 
-        doc.selectFirst("video[src]")?.absUrl("src")?.takeUnless { it.isBlank() }?.let { return it }
-        doc.selectFirst("video source[src]")?.absUrl("src")?.takeUnless { it.isBlank() }?.let { return it }
-        doc.select("meta[property=og:video], meta[property=og:video:url], meta[property=og:video:secure_url], meta[name=twitter:player:stream]")
-            .firstOrNull()?.attr("content")?.takeUnless { it.isBlank() }?.let { return it }
+        val description = doc.selectFirst("meta[property=og:description]")?.attr("content")?.trim()?.takeUnless { it.isBlank() }
+            ?: doc.selectFirst("meta[name=description]")?.attr("content")?.trim()?.takeUnless { it.isBlank() }
+            ?: doc.selectFirst("[class*=ozet], [class*=summary], [class*=synopsis], [class*=description], [class*=aciklama], [class*=konu]")
+                ?.text()?.trim()?.takeUnless { it.isBlank() || it.length < 15 }
+        val year = doc.guessYear()
+        val rating = doc.guessRating()
 
+        val candidates = mutableListOf<StreamCandidate>()
+        doc.select("video source[src]").forEach { src ->
+            val u = src.absUrl("src"); if (u.isBlank()) return@forEach
+            val lbl = src.attr("label").ifBlank { src.attr("res") }.ifBlank { guessStreamLabel(u, candidates.size) }
+            candidates += StreamCandidate(lbl, u)
+        }
+        doc.selectFirst("video[src]")?.absUrl("src")?.takeUnless { it.isBlank() }?.let {
+            if (candidates.none { c -> c.url == it }) candidates += StreamCandidate("Video", it)
+        }
+        doc.select("meta[property=og:video], meta[property=og:video:url], meta[property=og:video:secure_url]").forEach { m ->
+            val c = m.attr("content")
+            if (c.isNotBlank() && candidates.none { it.url == c }) candidates += StreamCandidate("Video (meta)", c)
+        }
+        // "Sunucu 1/2/3" gibi sekme/link butonları — her biri farklı bir kaynak/embed olabilir
+        doc.select("[data-src], [data-embed], [data-video], [data-player], [class*=server] a[href], [class*=sunucu] a[href], [class*=alternatif] a[href]")
+            .forEach { el ->
+                val u = sequenceOf("data-src", "data-embed", "data-video", "data-player", "href")
+                    .map { el.absUrl(it) }.firstOrNull { it.isNotBlank() } ?: return@forEach
+                if (looksLikeStreamUrl(u) && candidates.none { it.url == u }) {
+                    val label = el.text().trim().ifBlank { guessStreamLabel(u, candidates.size) }
+                    candidates += StreamCandidate(label, u)
+                }
+            }
+        // Gövdedeki/script içindeki tüm m3u8/mp4/mpd linklerini regex ile topla
         val html = doc.outerHtml()
-        streamUrlRegex.find(html)?.value?.let { return it }
-
-        // Bir seviye derine in: player genelde iframe içinde embed edilmiş olabilir
+        streamUrlRegex.findAll(html).forEach { m ->
+            val u = m.value
+            if (candidates.none { it.url == u }) candidates += StreamCandidate(guessStreamLabel(u, candidates.size), u)
+        }
+        // Bir seviye derine in: player iframe içinde embed edilmiş olabilir
         val iframeSrc = doc.selectFirst("iframe[src]")?.absUrl("src")
         if (!iframeSrc.isNullOrBlank()) {
             try {
-                val iframeDoc = Jsoup.connect(iframeSrc).userAgent("Mozilla/5.0 (Android) ScrapeFlix/0.7")
+                val iframeDoc = Jsoup.connect(iframeSrc).userAgent("Mozilla/5.0 (Android) ScrapeFlix/0.15")
                     .referrer(pageUrl).timeout(12000).followRedirects(true).get()
-                iframeDoc.selectFirst("video[src]")?.absUrl("src")?.takeUnless { it.isBlank() }?.let { return it }
-                iframeDoc.selectFirst("video source[src]")?.absUrl("src")?.takeUnless { it.isBlank() }?.let { return it }
-                streamUrlRegex.find(iframeDoc.outerHtml())?.value?.let { return it }
+                iframeDoc.selectFirst("video source[src]")?.absUrl("src")?.takeUnless { it.isBlank() }?.let {
+                    if (candidates.none { c -> c.url == it }) candidates += StreamCandidate(guessStreamLabel(it, candidates.size), it)
+                }
+                streamUrlRegex.findAll(iframeDoc.outerHtml()).forEach { m ->
+                    val u = m.value
+                    if (candidates.none { it.url == u }) candidates += StreamCandidate(guessStreamLabel(u, candidates.size), u)
+                }
             } catch (e: Exception) { /* embed alınamadı */ }
         }
-        null
-    } catch (e: Exception) { null }
+
+        PageAnalysis(description, year, rating, candidates.distinctBy { it.url }.take(12))
+    } catch (e: Exception) { PageAnalysis(null, null, null, emptyList()) }
 }
 
 /** Bilinen statik varlık uzantıları — bunlar için içerik-tipi sorgusu yapmaya gerek yok
@@ -371,24 +422,40 @@ private const val PLAY_TRIGGER_JS = """
  * simüle eder (reklamların geçmesi zaman aldığı ve genelde birden fazla tıklama gerektirdiği
  * için), bu sırada atılan tüm ağ isteklerini dinler. Bilinen video uzantılı/yollu istekleri
  * anında yakalar; şüpheli ama uzantısı gizlenmiş istekler için gerçek içerik tipine/gövde
- * imzasına bakar (ör. ".txt" uzantılı ama aslında m3u8 playlist olan dosyalar).
+ * imzasına bakar. İlk aday bulunduktan sonra birkaç saniye daha dinlemeye devam eder ki
+ * varsa alternatif sunucu/kalite linkleri de yakalansın (hepsi kullanıcıya listelenecek).
  */
-private suspend fun sniffStreamUrlViaWebView(context: Context, pageUrl: String, timeoutMs: Long = 34000L): String? =
+private suspend fun sniffStreamUrlsViaWebView(context: Context, pageUrl: String, timeoutMs: Long = 34000L): List<StreamCandidate> =
     withContext(Dispatchers.Main) {
         suspendCancellableCoroutine { cont ->
             var resolved = false
+            var settleScheduled = false
+            val found = mutableListOf<StreamCandidate>()
             val handler = Handler(Looper.getMainLooper())
             val webView = WebView(context.applicationContext)
             val sniffExecutor = java.util.concurrent.Executors.newFixedThreadPool(3)
 
-            fun finish(url: String?) {
+            fun finish() {
                 handler.post {
                     if (resolved) return@post
                     resolved = true
                     handler.removeCallbacksAndMessages(null)
                     try { webView.stopLoading(); webView.destroy() } catch (e: Exception) { /* yok say */ }
                     try { sniffExecutor.shutdownNow() } catch (e: Exception) { }
-                    if (cont.isActive) cont.resume(url)
+                    if (cont.isActive) cont.resume(found.toList())
+                }
+            }
+
+            fun addCandidate(url: String) {
+                handler.post {
+                    if (resolved) return@post
+                    if (found.none { it.url == url }) found += StreamCandidate(guessStreamLabel(url, found.size), url)
+                    if (!settleScheduled) {
+                        settleScheduled = true
+                        // İlk bulgudan sonra birkaç saniye daha bekle: alternatif kaynak/kalite
+                        // seçenekleri genelde art arda kısa aralıklarla yükleniyor.
+                        handler.postDelayed({ finish() }, 6000L)
+                    }
                 }
             }
 
@@ -404,14 +471,14 @@ private suspend fun sniffStreamUrlViaWebView(context: Context, pageUrl: String, 
                     val url = request.url.toString()
                     if (!resolved) {
                         if (looksLikeStreamUrl(url)) {
-                            finish(url)
+                            addCandidate(url)
                         } else if (!request.isForMainFrame && !shouldSkipContentSniff(url) &&
                             (url.startsWith("http://") || url.startsWith("https://"))
                         ) {
                             // Ağır olmasın diye ayrı bir thread havuzunda, WebView'in kendi
                             // isteğini engellemeden içerik tipini kontrol et.
                             sniffExecutor.execute {
-                                if (!resolved && sniffContentLooksLikeStream(url, pageUrl)) finish(url)
+                                if (!resolved && sniffContentLooksLikeStream(url, pageUrl)) addCandidate(url)
                             }
                         }
                     }
@@ -432,7 +499,7 @@ private suspend fun sniffStreamUrlViaWebView(context: Context, pageUrl: String, 
                 }
             }
 
-            handler.postDelayed({ finish(null) }, timeoutMs)
+            handler.postDelayed({ finish() }, timeoutMs)
             cont.invokeOnCancellation {
                 handler.post {
                     try { webView.stopLoading(); webView.destroy() } catch (e: Exception) { }
@@ -443,7 +510,7 @@ private suspend fun sniffStreamUrlViaWebView(context: Context, pageUrl: String, 
             try {
                 webView.loadUrl(pageUrl)
             } catch (e: Exception) {
-                finish(null)
+                finish()
             }
         }
     }
@@ -490,8 +557,19 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
     var streamBusy by mutableStateOf(false); private set
     var episodeParent by mutableStateOf<ScrapedItemEntity?>(null); private set
     var detailItem by mutableStateOf<ScrapedItemEntity?>(null); private set
-    fun openDetail(item: ScrapedItemEntity) { detailItem = item }
-    fun closeDetail() { detailItem = null }
+    var detailInfo by mutableStateOf<PageAnalysis?>(null); private set
+    var detailInfoBusy by mutableStateOf(false); private set
+    fun openDetail(item: ScrapedItemEntity) {
+        detailItem = item; detailInfo = null; detailInfoBusy = true
+        viewModelScope.launch(Dispatchers.IO) {
+            val info = analyzePage(item.url)
+            withContext(Dispatchers.Main) { detailInfoBusy = false; detailInfo = info }
+        }
+    }
+    fun closeDetail() { detailItem = null; detailInfo = null }
+    var streamCandidates by mutableStateOf<List<StreamCandidate>>(emptyList()); private set
+    var streamCandidatesTitle by mutableStateOf<String?>(null); private set
+    fun closeStreamPicker() { streamCandidates = emptyList(); streamCandidatesTitle = null }
     var episodes by mutableStateOf<List<EpisodeInfo>>(emptyList()); private set
     var episodesBusy by mutableStateOf(false); private set
     private var previewJob: kotlinx.coroutines.Job? = null
@@ -579,18 +657,18 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
 
     /** İçerik kartına tıklandığında çağrılır. Kategori artık sitenin kendi menü adı olduğu
      *  için (Film/Dizi gibi sabit bir sözlük yok), her tıklamada önce sayfada bölüm linki
-     *  var mı diye bakılır; yoksa (tek parçalı içerik) doğrudan akış linkine düşülür. */
+     *  var mı diye bakılır; yoksa (tek parçalı içerik) doğrudan akış linki(leri) aranır. */
     fun openItem(context: Context, item: ScrapedItemEntity) = loadEpisodes(context, item)
 
     /** Detay sayfasını tarayıp bölüm linklerini bulur ve diyalogda gösterir.
-     *  Hiç bölüm bulunamazsa (aslında tek parçalık bir sayfaysa) doğrudan akış linkine düşer. */
+     *  Hiç bölüm bulunamazsa (aslında tek parçalık bir sayfaysa) doğrudan akış linklerini arar. */
     fun loadEpisodes(context: Context, item: ScrapedItemEntity) {
         if (episodesBusy) return
         episodesBusy = true; episodeParent = item; episodes = emptyList()
         message = "Bölümler aranıyor: ${item.title}"
         viewModelScope.launch(Dispatchers.IO) {
             val found = try {
-                val doc = Jsoup.connect(item.url).userAgent("Mozilla/5.0 (Android) ScrapeFlix/0.10").timeout(15000).followRedirects(true).get()
+                val doc = Jsoup.connect(item.url).userAgent("Mozilla/5.0 (Android) ScrapeFlix/0.15").timeout(15000).followRedirects(true).get()
                 extractEpisodes(doc, item.url)
             } catch (e: Exception) { emptyList() }
             withContext(Dispatchers.Main) {
@@ -599,7 +677,7 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
                     episodes = found; message = ""
                 } else {
                     episodeParent = null
-                    openStream(context, item)
+                    findStreams(context, item.title, item.url)
                 }
             }
         }
@@ -607,29 +685,31 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
 
     fun closeEpisodes() { episodeParent = null; episodes = emptyList() }
 
-    /** İçerik kartına tıklandığında: sayfadaki gerçek akış linkini bulur ve doğrudan
-     *  o linki, cihazdaki uyumlu uygulamalar arasından seçim yaptırarak açar (tarayıcı yok).
-     *  Önce hızlı statik HTML analizini dener; bulamazsa 1DM benzeri bir yöntemle,
-     *  sayfayı gizli bir WebView'de gerçekten çalıştırıp ağ isteklerini dinleyerek arar. */
-    fun openStream(context: Context, item: ScrapedItemEntity) = openStream(context, item.title, item.url)
-
-    fun openStream(context: Context, title: String, url: String) {
+    /** Bir içeriğin (veya seçilen bölümün) TÜM akış linki adaylarını bulur ve kullanıcıya
+     *  bir liste olarak sunar — tarayıcıya değil, seçilen bir uygulamayla oynatılabilsin diye
+     *  hiçbiri otomatik açılmaz. Önce hızlı statik HTML analizini dener (birden fazla
+     *  sunucu/kalite <source> etiketi varsa hepsini toplar); hiçbir şey bulamazsa 1DM benzeri
+     *  yöntemle sayfayı gizli bir WebView'de çalıştırıp ağ isteklerini dinleyerek arar. */
+    fun findStreams(context: Context, title: String, url: String) {
         if (streamBusy) return
-        streamBusy = true; message = "Akış linki aranıyor: $title"
+        streamBusy = true; streamCandidatesTitle = title; streamCandidates = emptyList()
+        message = "Akış linkleri aranıyor: $title"
         viewModelScope.launch {
-            var streamUrl = withContext(Dispatchers.IO) { resolveStreamUrl(url) }
-            if (streamUrl == null) {
+            val analysis = withContext(Dispatchers.IO) { analyzePage(url) }
+            var candidates = analysis.candidates
+            if (candidates.isEmpty()) {
                 message = "Sayfa açılıp oynatma/reklam geçme tetikleniyor (biraz sürebilir): $title"
-                streamUrl = sniffStreamUrlViaWebView(context, url)
+                candidates = sniffStreamUrlsViaWebView(context, url)
             }
             streamBusy = false
-            if (streamUrl != null) {
-                message = ""
-                openContent(context, streamUrl)
-            } else {
-                message = "Akış linki bulunamadı: $title"
-            }
+            streamCandidates = candidates
+            message = if (candidates.isEmpty()) "Akış linki bulunamadı: $title" else ""
         }
+    }
+
+    fun pickStream(context: Context, url: String) {
+        openContent(context, url)
+        closeStreamPicker()
     }
 
     fun addSite(name: String, url: String) = viewModelScope.launch(Dispatchers.IO) {
@@ -681,7 +761,7 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
         if (busy) return; busy = true; selectedSiteId = site.id; message = "Ana sayfa taranıyor..."
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val ua = "Mozilla/5.0 (Android) ScrapeFlix/0.14"
+                val ua = "Mozilla/5.0 (Android) ScrapeFlix/0.15"
                 suspend fun fetch(url: String): Document? = try {
                     Jsoup.connect(url).userAgent(ua).timeout(12000).followRedirects(true).get()
                 } catch (e: Exception) { null }
@@ -689,10 +769,13 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
                 val visited = mutableSetOf<String>()
                 val found = mutableListOf<ScrapedItemEntity>()
                 var order = 0
-                var pageBudget = 90 // toplam sayfa isteği bütçesi (site çok büyükse taramayı sınırlar)
+                var pageBudget = 500 // toplam sayfa isteği bütçesi (site sonsuz sayfalıysa taramayı sınırlar)
                 val maxDepth = 2 // 1: ana menü, 2: onun alt menüsü
                 val semaphore = Semaphore(4)
                 var pagesScanned = 0
+                val startTime = System.currentTimeMillis()
+                val maxDurationMs = 6 * 60_000L // güvenlik sınırı: 6 dakika
+                fun timeLeft() = System.currentTimeMillis() - startTime < maxDurationMs
 
                 visited.add(normalizeUrlKey(site.url))
                 val mainDoc = Jsoup.connect(site.url).userAgent(ua).timeout(20000).followRedirects(true).get()
@@ -703,7 +786,7 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
 
                 var currentLevel = level1.map { MenuLink(it.label, it.url) to 1 }
                 var depth = 1
-                while (currentLevel.isNotEmpty() && depth <= maxDepth && pageBudget > 0) {
+                while (currentLevel.isNotEmpty() && depth <= maxDepth && pageBudget > 0 && timeLeft()) {
                     val batch = currentLevel.take(pageBudget)
                     val results = batch.map { (link, d) ->
                         async { semaphore.withPermit { Triple(link, d, fetch(link.url)) } }
@@ -717,15 +800,18 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
                         extractItems(page, site, link.label).forEach { found += it.copy(sortOrder = order++) }
                         pagesScanned++
 
-                        // Bu menünün sayfalamasını (2., 3. sayfa...) da takip et.
-                        var pageCount = 0
-                        while (pageBudget > 0 && pageCount < 8) {
+                        // Bu menünün TÜM sayfalamasını (2., 3., ... son sayfaya kadar) takip et —
+                        // tek sınır kalan bütçe ve genel zaman güvenliği.
+                        while (pageBudget > 0 && timeLeft()) {
                             val nextUrl = findNextPageUrl(page, link.url) ?: break
                             if (!visited.add(normalizeUrlKey(nextUrl))) break
                             val nextDoc = fetch(nextUrl) ?: break
-                            pageBudget--; pageCount++; pagesScanned++
+                            pageBudget--; pagesScanned++
                             extractItems(nextDoc, site, link.label).forEach { found += it.copy(sortOrder = order++) }
                             page = nextDoc
+                            if (pagesScanned % 5 == 0) {
+                                withContext(Dispatchers.Main) { message = "$pagesScanned sayfa tarandı (${link.label})..." }
+                            }
                         }
 
                         // Bu sayfanın kendi alt menüsünü keşfet (bir sonraki derinlik için).
@@ -747,7 +833,7 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
                 // geçmeyenler "Ana Sayfa" başlığı altında toplanır.
                 extractItems(mainDoc, site, "Ana Sayfa").forEach { found += it.copy(sortOrder = order++) }
 
-                val deduped = found.distinctBy { it.url }.take(3000)
+                val deduped = found.distinctBy { it.url }.take(5000)
                 db.itemDao().deleteForSite(site.id); if (deduped.isNotEmpty()) db.itemDao().insertAll(deduped)
                 db.siteDao().update(site.copy(lastUpdated=System.currentTimeMillis(),itemCount=deduped.size,profileStatus="Aktif"))
                 withContext(Dispatchers.Main) { message = "$pagesScanned sayfa tarandı, ${deduped.size} içerik bulundu."; busy = false }
@@ -793,9 +879,16 @@ enum class Page { Home, Sites, Watch, Settings }
     val sites by vm.sites.collectAsState()
     val context = LocalContext.current
     var q by remember { mutableStateOf("") }
+    var sortMode by remember { mutableStateOf("Orijinal") }
     val filterSiteId = vm.watchFilterSiteId
     val base = items.filter {
         (filterSiteId == null || it.siteId == filterSiteId) && (q.isBlank() || it.title.contains(q, true))
+    }
+    fun sorted(list: List<ScrapedItemEntity>): List<ScrapedItemEntity> = when (sortMode) {
+        "İsim" -> list.sortedBy { it.title.lowercase(Locale.getDefault()) }
+        "Yıl" -> list.sortedByDescending { it.year?.toIntOrNull() ?: -1 }
+        "Puan" -> list.sortedByDescending { it.rating?.let { r -> Regex("""\d+(\.\d+)?""").find(r)?.value?.toDoubleOrNull() } ?: -1.0 }
+        else -> list
     }
     // Uygulamanın kendi sabit kategorileri yok: her bölüm başlığı doğrudan sitenin kendi
     // menüsünden geliyor (item.category = o menünün görünen adı). Tek site seçiliyken
@@ -803,12 +896,12 @@ enum class Page { Home, Sites, Watch, Settings }
     // kendi menüsüne göre gruplanır.
     val siteNameById = remember(sites) { sites.associateBy({ it.id }, { it.name }) }
     data class Section(val header: String, val list: List<ScrapedItemEntity>)
-    val sections: List<Section> = remember(base, filterSiteId, siteNameById) {
+    val sections: List<Section> = remember(base, filterSiteId, siteNameById, sortMode) {
         if (filterSiteId != null) {
-            base.groupBy { it.category }.map { (cat, list) -> Section(cat, list) }
+            base.groupBy { it.category }.map { (cat, list) -> Section(cat, sorted(list)) }
         } else {
             base.groupBy { siteNameById[it.siteId] ?: "Bilinmeyen Site" }.flatMap { (siteName, siteItems) ->
-                siteItems.groupBy { it.category }.map { (cat, list) -> Section("$siteName · $cat", list) }
+                siteItems.groupBy { it.category }.map { (cat, list) -> Section("$siteName · $cat", sorted(list)) }
             }
         }
     }
@@ -829,6 +922,14 @@ enum class Page { Home, Sites, Watch, Settings }
         }
         Spacer(Modifier.height(10.dp))
         OutlinedTextField(q, { q = it }, Modifier.fillMaxWidth(), label = { Text("İçerik ara") })
+        Spacer(Modifier.height(8.dp))
+        Text("Sırala", color = Color.Gray, fontSize = 12.sp)
+        Spacer(Modifier.height(4.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            listOf("Orijinal", "İsim", "Yıl", "Puan").forEach {
+                FilterChip(selected = sortMode == it, onClick = { sortMode = it }, label = { Text(it) })
+            }
+        }
         Spacer(Modifier.height(8.dp))
         if (vm.streamBusy || vm.episodesBusy) LinearProgressIndicator(Modifier.fillMaxWidth())
         if (vm.message.isNotBlank()) Text(vm.message, color = Color.LightGray, fontSize = 12.sp, modifier = Modifier.padding(vertical = 4.dp))
@@ -875,7 +976,7 @@ enum class Page { Home, Sites, Watch, Settings }
                                     modifier = Modifier.fillMaxWidth()
                                         .clickable {
                                             vm.closeEpisodes()
-                                            vm.openStream(context, ep.title, ep.url)
+                                            vm.findStreams(context, ep.title, ep.url)
                                         }
                                         .padding(vertical = 12.dp)
                                 )
@@ -889,6 +990,45 @@ enum class Page { Home, Sites, Watch, Settings }
     }
     vm.detailItem?.let { item ->
         DetailDialog(vm = vm, context = context, item = item)
+    }
+    vm.streamCandidatesTitle?.let { title ->
+        AlertDialog(
+            onDismissRequest = { vm.closeStreamPicker() },
+            confirmButton = { TextButton({ vm.closeStreamPicker() }) { Text("Kapat") } },
+            title = { Text("Akış Linkleri") },
+            text = {
+                Column(Modifier.heightIn(max = 420.dp)) {
+                    Text(title, color = Color.Gray, fontSize = 12.sp)
+                    Spacer(Modifier.height(8.dp))
+                    if (vm.streamBusy) {
+                        LinearProgressIndicator(Modifier.fillMaxWidth())
+                        Spacer(Modifier.height(8.dp))
+                        Text(vm.message.ifBlank { "Aranıyor..." }, color = Color.Gray, fontSize = 12.sp)
+                    } else if (vm.streamCandidates.isEmpty()) {
+                        Text("Akış linki bulunamadı.", color = Color.Gray)
+                    } else {
+                        Text("${vm.streamCandidates.size} kaynak bulundu — birini seç:", color = Color.LightGray, fontSize = 12.sp)
+                        Spacer(Modifier.height(6.dp))
+                        LazyColumn(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            items(vm.streamCandidates) { c ->
+                                Row(
+                                    Modifier.fillMaxWidth().clickable { vm.pickStream(context, c.url) }.padding(vertical = 12.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(Icons.Default.PlayArrow, null, tint = Color(0xFFE50914))
+                                    Spacer(Modifier.width(8.dp))
+                                    Column {
+                                        Text(c.label, fontWeight = FontWeight.Medium)
+                                        Text(c.url, color = Color.Gray, fontSize = 10.sp, maxLines = 1)
+                                    }
+                                }
+                                HorizontalDivider(color = Color(0xFF2A2A2A))
+                            }
+                        }
+                    }
+                }
+            }
+        )
     }
 }
 
@@ -929,6 +1069,10 @@ private fun PosterCard(context: Context, item: ScrapedItemEntity, onClick: () ->
  *  gerçek "İzle" eylemi (bölüm var mı diye bakar, akış linkini bulur, uygulama seçtirir). */
 @Composable
 private fun DetailDialog(vm: ScrapeViewModel, context: Context, item: ScrapedItemEntity) {
+    val info = vm.detailInfo
+    val year = item.year ?: info?.year
+    val rating = item.rating ?: info?.rating
+    val description = item.description?.takeUnless { it.isBlank() } ?: info?.description
     Dialog(onDismissRequest = { vm.closeDetail() }) {
         Card(
             shape = RoundedCornerShape(16.dp),
@@ -939,7 +1083,7 @@ private fun DetailDialog(vm: ScrapeViewModel, context: Context, item: ScrapedIte
                     AsyncImage(
                         model = coil.request.ImageRequest.Builder(context)
                             .data(item.imageUrl)
-                            .addHeader("User-Agent", "Mozilla/5.0 (Android) ScrapeFlix/0.14")
+                            .addHeader("User-Agent", "Mozilla/5.0 (Android) ScrapeFlix/0.15")
                             .addHeader("Referer", refererFor(item.url))
                             .crossfade(true)
                             .build(),
@@ -951,20 +1095,25 @@ private fun DetailDialog(vm: ScrapeViewModel, context: Context, item: ScrapedIte
                 Column(Modifier.padding(18.dp)) {
                     Text(item.title, fontSize = 20.sp, fontWeight = FontWeight.Bold, color = Color.White)
                     Spacer(Modifier.height(6.dp))
-                    if (item.year != null || item.rating != null) {
+                    if (year != null || rating != null) {
                         Row {
-                            item.year?.let { Text(it, color = Color(0xFFD4AF37), fontWeight = FontWeight.SemiBold, fontSize = 14.sp) }
-                            if (item.year != null && item.rating != null) Text(" • ", color = Color.Gray)
-                            item.rating?.let { Text("★ $it", color = Color(0xFFD4AF37), fontWeight = FontWeight.SemiBold, fontSize = 14.sp) }
+                            year?.let { Text(it, color = Color(0xFFD4AF37), fontWeight = FontWeight.SemiBold, fontSize = 14.sp) }
+                            if (year != null && rating != null) Text(" • ", color = Color.Gray)
+                            rating?.let { Text("★ $it", color = Color(0xFFD4AF37), fontWeight = FontWeight.SemiBold, fontSize = 14.sp) }
                         }
                         Spacer(Modifier.height(6.dp))
                     }
                     Text(item.category, color = Color.Gray, fontSize = 12.sp)
                     Spacer(Modifier.height(12.dp))
-                    Text(
-                        item.description?.takeUnless { it.isBlank() } ?: "Özet bulunamadı.",
-                        color = Color.LightGray, fontSize = 14.sp
-                    )
+                    if (vm.detailInfoBusy && description == null) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
+                            Spacer(Modifier.width(8.dp))
+                            Text("Özet aranıyor...", color = Color.Gray, fontSize = 13.sp)
+                        }
+                    } else {
+                        Text(description ?: "Özet bulunamadı.", color = Color.LightGray, fontSize = 14.sp)
+                    }
                     Spacer(Modifier.height(18.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
                         Button(
@@ -1156,6 +1305,6 @@ fun SiteEditorDialog(
 
 @Composable fun AddSiteDialog(onDismiss:()->Unit,onAdd:(String,String)->Unit){var n by remember{mutableStateOf("")};var u by remember{mutableStateOf("")};AlertDialog(onDismissRequest=onDismiss,title={Text("Yeni Site Ekle")},text={Column(verticalArrangement=Arrangement.spacedBy(10.dp)){OutlinedTextField(n,{n=it},label={Text("Site adı")});OutlinedTextField(u,{u=it},label={Text("Site adresi")})}},confirmButton={Button({onAdd(n,u)},enabled=u.isNotBlank()){Text("Kaydet")}},dismissButton={TextButton(onDismiss){Text("İptal")}})}
 
-@Composable fun SettingsScreen(){Column(Modifier.fillMaxSize().padding(20.dp)){Text("Ayarlar",fontSize=28.sp,fontWeight=FontWeight.Bold);Spacer(Modifier.height(16.dp));Text("ScrapeFlix v0.14.0",fontWeight=FontWeight.Bold);Spacer(Modifier.height(8.dp));Text("v0.14: Tarama artık çok seviyeli — ana menü, onun alt menüleri ve her sayfanın sayfalaması (2., 3. sayfa...) takip ediliyor. İçerikler ekranında her menü başlığının altında yatay kaydırmalı poster satırı var; posterlere dokununca ayrı bir detay kartı (görsel, yıl, puan, özet) açılıyor ve İzle butonuyla oynatma başlıyor.",color=Color.Gray)}}
+@Composable fun SettingsScreen(){Column(Modifier.fillMaxSize().padding(20.dp)){Text("Ayarlar",fontSize=28.sp,fontWeight=FontWeight.Bold);Spacer(Modifier.height(16.dp));Text("ScrapeFlix v0.15.0",fontWeight=FontWeight.Bold);Spacer(Modifier.height(8.dp));Text("v0.15: Tarama artık her menünün TÜM sayfalarını (sayfalama) takip ediyor, sabit sayfa sınırı yok. Detay kartı açılınca özet/yıl/puan sayfadan otomatik aranıyor. İzle artık tek link açmıyor — bulunan TÜM akış linklerini (varsa canlı yayın dahil) listeleyip seçim yaptırıyor. İçerikler sırasını isim/yıl/puana göre değiştirebilirsin.",color=Color.Gray)}}
 
 class MainActivity:ComponentActivity(){override fun onCreate(b:Bundle?){super.onCreate(b);setContent{App()}}}
