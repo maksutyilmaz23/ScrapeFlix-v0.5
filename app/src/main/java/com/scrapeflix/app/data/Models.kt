@@ -32,3 +32,16 @@ data class ScrapedItemEntity(
     val sortOrder: Int = 0,
     val scrapedAt: Long = System.currentTimeMillis()
 )
+
+@Entity(tableName = "downloads")
+data class DownloadEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val title: String,
+    val sourceUrl: String,
+    val folderPath: String,
+    val playbackFile: String = "video.mp4",
+    val status: String = "İndiriliyor", // İndiriliyor, Tamamlandı, Hata, İptal Edildi
+    val progress: Int = 0,
+    val errorMessage: String? = null,
+    val createdAt: Long = System.currentTimeMillis()
+)

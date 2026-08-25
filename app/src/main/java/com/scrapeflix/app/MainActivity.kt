@@ -40,10 +40,13 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
 import com.scrapeflix.app.data.*
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
@@ -54,6 +57,7 @@ import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.text.SimpleDateFormat
+import java.io.File
 import java.util.*
 
 data class ProfileSuggestion(
@@ -289,6 +293,177 @@ private fun refererFor(url: String): String = try {
 private val streamUrlRegex = Regex("""https?://[^\s"'<>\\]+\.(m3u8|mp4|mpd)(\?[^\s"'<>\\]*)?""", RegexOption.IGNORE_CASE)
 
 data class StreamCandidate(val label: String, val url: String)
+
+/** İndirilen içeriği (HLS'te birden çok segment dosyası dahil) cihaz dışına açmadan,
+ *  uygulama içi bir loopback (127.0.0.1) HTTP sunucusu üzerinden dış oynatıcıya sunar.
+ *  Bu sayede tek bir dosyaya content:// izni vermek yerine, m3u8'in referans verdiği
+ *  komşu segment dosyalarına da erişim sorunsuz sağlanır — HLS indirme araçlarının
+ *  standart yöntemi budur. */
+class LocalFileServer(private val root: File) {
+    private var serverSocket: java.net.ServerSocket? = null
+    var port: Int = 0; private set
+
+    fun start(scope: CoroutineScope) {
+        if (serverSocket != null) return
+        val socket = java.net.ServerSocket(0)
+        serverSocket = socket
+        port = socket.localPort
+        scope.launch(Dispatchers.IO) {
+            while (isActive) {
+                val client = try { socket.accept() } catch (e: Exception) { break }
+                launch(Dispatchers.IO) { handleClient(client) }
+            }
+        }
+    }
+
+    private fun handleClient(client: java.net.Socket) {
+        client.use { sock ->
+            try {
+                val input = sock.getInputStream().bufferedReader()
+                val requestLine = input.readLine() ?: return
+                var line: String?
+                do { line = input.readLine() } while (!line.isNullOrBlank())
+                val rawPath = requestLine.split(" ").getOrNull(1)?.trimStart('/') ?: return
+                val path = java.net.URLDecoder.decode(rawPath, "UTF-8")
+                val file = File(root, path)
+                val out = sock.getOutputStream()
+                if (!file.exists() || !file.isFile || !file.canonicalPath.startsWith(root.canonicalPath)) {
+                    out.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n".toByteArray()); return
+                }
+                val mime = when {
+                    file.name.endsWith(".m3u8") -> "application/vnd.apple.mpegurl"
+                    file.name.endsWith(".ts") -> "video/mp2t"
+                    file.name.endsWith(".mp4") -> "video/mp4"
+                    else -> "application/octet-stream"
+                }
+                out.write("HTTP/1.1 200 OK\r\nContent-Type: $mime\r\nContent-Length: ${file.length()}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n".toByteArray())
+                file.inputStream().use { it.copyTo(out) }
+            } catch (e: Exception) { /* istemci bağlantıyı kesmiş olabilir, yok say */ }
+        }
+    }
+
+    fun stop() { try { serverSocket?.close() } catch (e: Exception) { }; serverSocket = null }
+}
+
+private fun fetchText(url: String): String? = try {
+    (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply {
+        instanceFollowRedirects = true; connectTimeout = 12000; readTimeout = 12000
+        setRequestProperty("User-Agent", "Mozilla/5.0 (Android) ScrapeFlix/0.17")
+    }.inputStream.bufferedReader().use { it.readText() }
+} catch (e: Exception) { null }
+
+private fun fetchBytes(url: String): ByteArray? = try {
+    (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply {
+        instanceFollowRedirects = true; connectTimeout = 12000; readTimeout = 20000
+        setRequestProperty("User-Agent", "Mozilla/5.0 (Android) ScrapeFlix/0.17")
+    }.inputStream.use { it.readBytes() }
+} catch (e: Exception) { null }
+
+private fun resolveRelative(base: String, ref: String): String = try {
+    if (ref.startsWith("http://") || ref.startsWith("https://")) ref else java.net.URL(java.net.URL(base), ref).toString()
+} catch (e: Exception) { ref }
+
+private suspend fun updateDownload(db: AppDatabase, id: Long, progress: Int? = null, status: String? = null, error: String? = null, playbackFile: String? = null) {
+    val current = db.downloadDao().getById(id) ?: return
+    db.downloadDao().update(
+        current.copy(
+            progress = progress ?: current.progress,
+            status = status ?: current.status,
+            errorMessage = error ?: current.errorMessage,
+            playbackFile = playbackFile ?: current.playbackFile
+        )
+    )
+}
+
+/** Doğrudan bir video dosyasını (mp4 vb.) yerel depolamaya indirir, ilerlemeyi kaydeder. */
+private suspend fun downloadDirect(db: AppDatabase, id: Long, folder: File, url: String) {
+    val ext = url.substringBefore('?').substringAfterLast('.', "mp4").take(5).ifBlank { "mp4" }
+    val outFile = File(folder, "video.$ext")
+    val conn = (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply {
+        instanceFollowRedirects = true
+        connectTimeout = 15000; readTimeout = 20000
+        setRequestProperty("User-Agent", "Mozilla/5.0 (Android) ScrapeFlix/0.17")
+        setRequestProperty("Referer", refererFor(url))
+    }
+    conn.connect()
+    if (conn.responseCode !in 200..299) throw Exception("Sunucu hatası: ${conn.responseCode}")
+    val total = conn.contentLengthLong
+    var readBytes = 0L
+    var lastUpdate = 0L
+    conn.inputStream.use { input ->
+        outFile.outputStream().use { output ->
+            val buffer = ByteArray(64 * 1024)
+            while (true) {
+                val n = input.read(buffer); if (n <= 0) break
+                output.write(buffer, 0, n)
+                readBytes += n
+                if (total > 0) {
+                    val now = System.currentTimeMillis()
+                    if (now - lastUpdate > 400) {
+                        lastUpdate = now
+                        updateDownload(db, id, progress = ((readBytes * 100) / total).toInt().coerceIn(0, 99))
+                    }
+                }
+            }
+        }
+    }
+    updateDownload(db, id, progress = 100, status = "Tamamlandı", playbackFile = outFile.name)
+}
+
+/** HLS (m3u8) akışını indirir: master playlist ise bir varyant seçer, segmentleri paralel
+ *  indirir ve yerel bir m3u8'i yerel dosya adlarına göre yeniden yazar. Şifreli
+ *  (#EXT-X-KEY, METHOD != NONE) akışlar güvenli şekilde reddedilir (deşifre desteklenmiyor). */
+private suspend fun downloadHls(db: AppDatabase, id: Long, folder: File, playlistUrl: String) {
+    var currentUrl = playlistUrl
+    var text = fetchText(currentUrl) ?: throw Exception("Playlist indirilemedi")
+
+    if (text.contains("#EXT-X-STREAM-INF")) {
+        val lines = text.lines()
+        val idx = lines.indexOfFirst { it.startsWith("#EXT-X-STREAM-INF") }
+        val variantRef = if (idx >= 0) lines.drop(idx + 1).firstOrNull { it.isNotBlank() && !it.startsWith("#") } else null
+        if (variantRef != null) {
+            currentUrl = resolveRelative(currentUrl, variantRef.trim())
+            text = fetchText(currentUrl) ?: throw Exception("Alt playlist indirilemedi")
+        }
+    }
+    if (text.contains("#EXT-X-KEY") && !text.contains("METHOD=NONE")) {
+        throw Exception("Bu akış şifreli (DRM/AES), indirme desteklenmiyor")
+    }
+
+    val lines = text.lines()
+    val segmentRefs = lines.filter { it.isNotBlank() && !it.startsWith("#") }
+    if (segmentRefs.isEmpty()) throw Exception("Segment bulunamadı")
+    val segmentUrls = segmentRefs.map { resolveRelative(currentUrl, it.trim()) }
+
+    val rewritten = StringBuilder()
+    var segIndex = 0
+    for (line in lines) {
+        if (line.isBlank() || line.startsWith("#")) { rewritten.appendLine(line) }
+        else { rewritten.appendLine("seg_%04d.ts".format(segIndex)); segIndex++ }
+    }
+    File(folder, "playlist.m3u8").writeText(rewritten.toString())
+
+    var done = 0
+    val semaphore = Semaphore(4)
+    coroutineScope {
+        segmentUrls.forEachIndexed { idx, segUrl ->
+            launch(Dispatchers.IO) {
+                semaphore.withPermit {
+                    try {
+                        val bytes = fetchBytes(segUrl)
+                        if (bytes != null) File(folder, "seg_%04d.ts".format(idx)).writeBytes(bytes)
+                    } catch (e: Exception) { /* tek segment atlanırsa oynatma genelde yine de devam eder */ }
+                    done++
+                    if (done % 3 == 0 || done == segmentUrls.size) {
+                        updateDownload(db, id, progress = ((done * 100) / segmentUrls.size).coerceIn(0, 99))
+                    }
+                }
+            }
+        }
+    }
+    updateDownload(db, id, progress = 100, status = "Tamamlandı", playbackFile = "playlist.m3u8")
+}
+
 data class PageAnalysis(val description: String?, val year: String?, val rating: String?, val candidates: List<StreamCandidate>)
 
 private fun guessStreamLabel(url: String, index: Int): String {
@@ -595,6 +770,63 @@ private fun extractEpisodes(doc: Document, baseUrl: String): List<EpisodeInfo> {
 class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
     val sites = db.siteDao().observeSites().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
     val allItems = db.itemDao().observeAll().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    val downloads = db.downloadDao().observeAll().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    private val downloadJobs = mutableMapOf<Long, kotlinx.coroutines.Job>()
+    private var localServer: LocalFileServer? = null
+    private fun downloadsRoot(context: Context): File = File(context.getExternalFilesDir(null), "downloads").apply { mkdirs() }
+
+    /** Verilen akış linkini (mp4 veya m3u8) cihaza indirir; ilerleme "downloads" listesinden
+     *  gözlemlenebilir. İndirme, ViewModel'in yaşam döngüsüne bağlıdır — uygulama tamamen
+     *  kapatılırsa (görev listesinden kaydırılırsa) devam etmez, arka planda değil önde kalmalı. */
+    fun startDownload(context: Context, title: String, url: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val folderName = "d_${System.currentTimeMillis()}"
+            val folder = File(downloadsRoot(context), folderName).apply { mkdirs() }
+            val id = db.downloadDao().insert(DownloadEntity(title = title, sourceUrl = url, folderPath = folderName))
+            withContext(Dispatchers.Main) { message = "İndirme başladı: $title" }
+            val isHls = url.substringBefore('?').lowercase(Locale.getDefault()).let {
+                it.endsWith(".m3u8") || it.contains("/hls/") || it.contains("sublist") || it.contains("playlist") || it.contains("chunklist")
+            }
+            val job = viewModelScope.launch(Dispatchers.IO) {
+                try {
+                    if (isHls) downloadHls(db, id, folder, url) else downloadDirect(db, id, folder, url)
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    updateDownload(db, id, status = "İptal Edildi")
+                } catch (e: Exception) {
+                    updateDownload(db, id, status = "Hata", error = e.message ?: "Bilinmeyen hata")
+                } finally {
+                    downloadJobs.remove(id)
+                }
+            }
+            downloadJobs[id] = job
+        }
+    }
+
+    fun cancelDownload(d: DownloadEntity) { downloadJobs[d.id]?.cancel() }
+
+    fun deleteDownload(context: Context, d: DownloadEntity) {
+        downloadJobs[d.id]?.cancel()
+        viewModelScope.launch(Dispatchers.IO) {
+            try { File(downloadsRoot(context), d.folderPath).deleteRecursively() } catch (e: Exception) { }
+            db.downloadDao().delete(d)
+        }
+    }
+
+    /** İndirilen içeriği, yerel loopback sunucu üzerinden dış oynatıcı seçtirerek çevrimdışı oynatır. */
+    fun playDownload(context: Context, d: DownloadEntity) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val root = downloadsRoot(context)
+            var server = localServer
+            if (server == null) {
+                server = LocalFileServer(root)
+                server.start(viewModelScope)
+                localServer = server
+            }
+            val playUrl = "http://127.0.0.1:${server.port}/${d.folderPath}/${d.playbackFile}"
+            withContext(Dispatchers.Main) { openContent(context, playUrl) }
+        }
+    }
+
     var selectedSiteId by mutableStateOf<Long?>(null); private set
     var watchFilterSiteId by mutableStateOf<Long?>(null); private set
     fun setWatchFilter(siteId: Long?) { watchFilterSiteId = siteId }
@@ -914,16 +1146,48 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
         }
     }
 
+    override fun onCleared() {
+        localServer?.stop()
+        super.onCleared()
+    }
 }
 
 class VmFactory(private val context: Context): ViewModelProvider.Factory { override fun <T:ViewModel> create(c:Class<T>):T { @Suppress("UNCHECKED_CAST") return ScrapeViewModel(AppDatabase.get(context)) as T } }
-enum class Page { Home, Sites, Watch, Settings }
+enum class Page { Home, Sites, Watch, Downloads, Settings }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable fun App(vm:ScrapeViewModel=viewModel(factory=VmFactory(LocalContext.current))) {
     var page by remember{mutableStateOf(Page.Home)}; var add by remember{mutableStateOf(false)}; var editor by remember{mutableStateOf<SiteEntity?>(null)}; var preview by remember{mutableStateOf(false)}
     MaterialTheme(colorScheme=darkColorScheme(background=Color(0xFF080808),surface=Color(0xFF151515),primary=Color(0xFFE50914))) {
-        Scaffold(containerColor=Color(0xFF080808),topBar={TopAppBar(title={Text("SCRAPEFLIX",fontWeight=FontWeight.Bold)},colors=TopAppBarDefaults.topAppBarColors(containerColor=Color.Black,titleContentColor=Color.White),actions={IconButton({add=true}){Icon(Icons.Default.Add,"Yeni site")}})},bottomBar={NavigationBar(containerColor=Color.Black){NavigationBarItem(page==Page.Home,{page=Page.Home},icon={Icon(Icons.Default.Home,null)},label={Text("Ana")});NavigationBarItem(page==Page.Sites,{page=Page.Sites},icon={Icon(Icons.Default.Language,null)},label={Text("Siteler")});NavigationBarItem(page==Page.Watch,{page=Page.Watch},icon={Icon(Icons.Default.PlayArrow,null)},label={Text("İçerikler")});NavigationBarItem(page==Page.Settings,{page=Page.Settings},icon={Icon(Icons.Default.Settings,null)},label={Text("Ayarlar")})}}){pad->Box(Modifier.padding(pad).fillMaxSize()){when(page){Page.Home->HomeScreen(vm){page=Page.Sites};Page.Sites->SitesScreen(vm, {add=true}, {editor=it}) {s->vm.setWatchFilter(s.id);page=Page.Watch};Page.Watch->WatchScreen(vm);Page.Settings->SettingsScreen()}}}
+        Scaffold(
+            containerColor = Color(0xFF080808),
+            topBar = {
+                TopAppBar(
+                    title = { Text("SCRAPEFLIX", fontWeight = FontWeight.Bold) },
+                    colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Black, titleContentColor = Color.White),
+                    actions = { IconButton({ add = true }) { Icon(Icons.Default.Add, "Yeni site") } }
+                )
+            },
+            bottomBar = {
+                NavigationBar(containerColor = Color.Black) {
+                    NavigationBarItem(page == Page.Home, { page = Page.Home }, icon = { Icon(Icons.Default.Home, null) }, label = { Text("Ana") })
+                    NavigationBarItem(page == Page.Sites, { page = Page.Sites }, icon = { Icon(Icons.Default.Language, null) }, label = { Text("Siteler") })
+                    NavigationBarItem(page == Page.Watch, { page = Page.Watch }, icon = { Icon(Icons.Default.PlayArrow, null) }, label = { Text("İçerikler") })
+                    NavigationBarItem(page == Page.Downloads, { page = Page.Downloads }, icon = { Icon(Icons.Default.Download, null) }, label = { Text("İndirilenler") })
+                    NavigationBarItem(page == Page.Settings, { page = Page.Settings }, icon = { Icon(Icons.Default.Settings, null) }, label = { Text("Ayarlar") })
+                }
+            }
+        ) { pad ->
+            Box(Modifier.padding(pad).fillMaxSize()) {
+                when (page) {
+                    Page.Home -> HomeScreen(vm) { page = Page.Sites }
+                    Page.Sites -> SitesScreen(vm, { add = true }, { editor = it }) { s -> vm.setWatchFilter(s.id); page = Page.Watch }
+                    Page.Watch -> WatchScreen(vm)
+                    Page.Downloads -> DownloadsScreen(vm)
+                    Page.Settings -> SettingsScreen()
+                }
+            }
+        }
         if(add)AddSiteDialog({add=false}){n,u->vm.addSite(n,u);add=false;page=Page.Sites}
         editor?.let{
             LaunchedEffect(it.id) { vm.loadPreviewHtml(it) }
@@ -1090,9 +1354,12 @@ enum class Page { Home, Sites, Watch, Settings }
                                 ) {
                                     Icon(Icons.Default.PlayArrow, null, tint = Color(0xFFE50914))
                                     Spacer(Modifier.width(8.dp))
-                                    Column {
+                                    Column(Modifier.weight(1f)) {
                                         Text(c.label, fontWeight = FontWeight.Medium)
                                         Text(c.url, color = Color.Gray, fontSize = 10.sp, maxLines = 1)
+                                    }
+                                    IconButton({ vm.startDownload(context, "$title — ${c.label}", c.url) }) {
+                                        Icon(Icons.Default.Download, "İndir", tint = Color(0xFFD4AF37))
                                     }
                                 }
                                 HorizontalDivider(color = Color(0xFF2A2A2A))
@@ -1378,6 +1645,57 @@ fun SiteEditorDialog(
 
 @Composable fun AddSiteDialog(onDismiss:()->Unit,onAdd:(String,String)->Unit){var n by remember{mutableStateOf("")};var u by remember{mutableStateOf("")};AlertDialog(onDismissRequest=onDismiss,title={Text("Yeni Site Ekle")},text={Column(verticalArrangement=Arrangement.spacedBy(10.dp)){OutlinedTextField(n,{n=it},label={Text("Site adı")});OutlinedTextField(u,{u=it},label={Text("Site adresi")})}},confirmButton={Button({onAdd(n,u)},enabled=u.isNotBlank()){Text("Kaydet")}},dismissButton={TextButton(onDismiss){Text("İptal")}})}
 
-@Composable fun SettingsScreen(){Column(Modifier.fillMaxSize().padding(20.dp)){Text("Ayarlar",fontSize=28.sp,fontWeight=FontWeight.Bold);Spacer(Modifier.height(16.dp));Text("ScrapeFlix v0.16.0",fontWeight=FontWeight.Bold);Spacer(Modifier.height(8.dp));Text("v0.16: Tarama artık robots.txt kurallarına uyuyor, canonical URL'leri tekrar taramayı önlemek için kullanıyor, menü/kategori hiyerarşisini 2 seviyeyle sınırlı değil (pratikte site ne kadar derinse) takip ediyor ve erişilemeyen sayfalarda durmadan devam ediyor.",color=Color.Gray)}}
+@Composable fun DownloadsScreen(vm: ScrapeViewModel) {
+    val downloads by vm.downloads.collectAsState()
+    val context = LocalContext.current
+    Column(Modifier.fillMaxSize().padding(16.dp)) {
+        Text("İndirilenler", fontSize = 28.sp, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(4.dp))
+        Text("Çevrimdışı izlemek için indirdiğin içerikler", color = Color.Gray, fontSize = 12.sp)
+        Spacer(Modifier.height(14.dp))
+        if (downloads.isEmpty()) {
+            Text("Henüz indirme yok. Bir içerikte akış linki listesinden indir simgesine dokun.", color = Color.Gray)
+        } else {
+            LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                items(downloads, key = { it.id }) { d ->
+                    Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp), colors = CardDefaults.cardColors(containerColor = Color(0xFF191919))) {
+                        Column(Modifier.padding(14.dp)) {
+                            Text(d.title, fontWeight = FontWeight.Bold, maxLines = 2)
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                when (d.status) {
+                                    "İndiriliyor" -> "İndiriliyor — %${d.progress}"
+                                    "Hata" -> "Hata: ${d.errorMessage ?: "bilinmeyen"}"
+                                    else -> d.status
+                                },
+                                color = when (d.status) {
+                                    "Tamamlandı" -> Color(0xFF4CAF50)
+                                    "Hata" -> Color(0xFFE57373)
+                                    else -> Color.Gray
+                                },
+                                fontSize = 12.sp
+                            )
+                            if (d.status == "İndiriliyor") {
+                                Spacer(Modifier.height(6.dp))
+                                LinearProgressIndicator(progress = { d.progress / 100f }, modifier = Modifier.fillMaxWidth())
+                            }
+                            Spacer(Modifier.height(8.dp))
+                            Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                                when (d.status) {
+                                    "Tamamlandı" -> TextButton({ vm.playDownload(context, d) }) { Icon(Icons.Default.PlayArrow, null); Text(" Oynat") }
+                                    "İndiriliyor" -> TextButton({ vm.cancelDownload(d) }) { Icon(Icons.Default.Close, null); Text(" İptal") }
+                                    else -> {}
+                                }
+                                TextButton({ vm.deleteDownload(context, d) }) { Icon(Icons.Default.Delete, null); Text(" Sil") }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable fun SettingsScreen(){Column(Modifier.fillMaxSize().padding(20.dp)){Text("Ayarlar",fontSize=28.sp,fontWeight=FontWeight.Bold);Spacer(Modifier.height(16.dp));Text("ScrapeFlix v0.17.0",fontWeight=FontWeight.Bold);Spacer(Modifier.height(8.dp));Text("v0.17: İçerikleri indirip çevrimdışı izleyebilirsin — akış linki listesindeki indir simgesine dokun, İndirilenler sekmesinden ilerlemeyi takip et ve tamamlanınca Oynat'a bas.",color=Color.Gray)}}
 
 class MainActivity:ComponentActivity(){override fun onCreate(b:Bundle?){super.onCreate(b);setContent{App()}}}

@@ -21,3 +21,14 @@ interface ItemDao {
     @Insert suspend fun insertAll(items: List<ScrapedItemEntity>)
     @Query("DELETE FROM scraped_items WHERE siteId = :siteId") suspend fun deleteForSite(siteId: Long)
 }
+
+@Dao
+interface DownloadDao {
+    @Query("SELECT * FROM downloads ORDER BY createdAt DESC")
+    fun observeAll(): Flow<List<DownloadEntity>>
+    @Query("SELECT * FROM downloads WHERE id = :id LIMIT 1")
+    suspend fun getById(id: Long): DownloadEntity?
+    @Insert suspend fun insert(d: DownloadEntity): Long
+    @Update suspend fun update(d: DownloadEntity)
+    @Delete suspend fun delete(d: DownloadEntity)
+}
