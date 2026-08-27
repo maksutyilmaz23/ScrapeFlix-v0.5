@@ -11,12 +11,17 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -32,15 +37,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
@@ -489,6 +491,26 @@ private fun guessStreamLabel(url: String, index: Int): String {
 
 /** İçerik sayfasını tek seferde analiz eder: özet, yıl, puan ve bulunabilen TÜM akış linki
  *  adaylarını (birden fazla sunucu/kalite seçeneği olabilir) birlikte döndürür. */
+/** Verilen metni Türkçeye çevirir (kaynak dil otomatik algılanır). Ek kütüphane/API anahtarı
+ *  gerektirmeyen, tarayıcıların da kullandığı genel çeviri uç noktası üzerinden çalışır. */
+private fun translateToTurkish(text: String): String? {
+    if (text.isBlank()) return null
+    return try {
+        val encoded = java.net.URLEncoder.encode(text.take(3000), "UTF-8")
+        val url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=tr&dt=t&q=$encoded"
+        val body = (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply {
+            connectTimeout = 10000; readTimeout = 10000
+            setRequestProperty("User-Agent", "Mozilla/5.0 (Android) ScrapeFlix/0.19")
+        }.inputStream.bufferedReader().use { it.readText() }
+        val segments = org.json.JSONArray(body).getJSONArray(0)
+        val sb = StringBuilder()
+        for (i in 0 until segments.length()) {
+            sb.append(segments.getJSONArray(i).optString(0))
+        }
+        sb.toString().trim().ifBlank { null }
+    } catch (e: Exception) { null }
+}
+
 private fun analyzePage(pageUrl: String): PageAnalysis {
     return try {
         val doc = Jsoup.connect(pageUrl).userAgent("Mozilla/5.0 (Android) ScrapeFlix/0.15").timeout(15000).followRedirects(true).get()
@@ -778,6 +800,127 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
     val sites = db.siteDao().observeSites().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
     val allItems = db.itemDao().observeAll().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
     val downloads = db.downloadDao().observeAll().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    val favorites = db.itemDao().observeFavorites().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    fun toggleFavorite(item: ScrapedItemEntity) {
+        viewModelScope.launch(Dispatchers.IO) { db.itemDao().setFavorite(item.id, !item.isFavorite) }
+    }
+
+    private val translationCache = mutableMapOf<Long, String>()
+    var translatedDescription by mutableStateOf<String?>(null); private set
+    var translating by mutableStateOf(false); private set
+    var showingTranslation by mutableStateOf(false); private set
+
+    fun translateDetailDescription(item: ScrapedItemEntity, text: String) {
+        translationCache[item.id]?.let { translatedDescription = it; showingTranslation = true; return }
+        if (translating) return
+        translating = true
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) { translateToTurkish(text) }
+            translating = false
+            if (result != null) { translationCache[item.id] = result; translatedDescription = result; showingTranslation = true }
+            else message = "Çeviri başarısız oldu"
+        }
+    }
+
+    fun toggleTranslationView() { showingTranslation = !showingTranslation }
+    fun resetTranslationState() { translatedDescription = null; showingTranslation = false }
+
+    /** Tüm siteleri ve içerikleri okunabilir bir JSON dosyasına yazar (kullanıcı konumu seçer). */
+    fun exportBackup(context: Context, uri: Uri) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val sitesJson = org.json.JSONArray()
+                for (s in sites.value) {
+                    sitesJson.put(
+                        org.json.JSONObject().apply {
+                            put("id", s.id); put("name", s.name); put("url", s.url)
+                            put("itemSelector", s.itemSelector); put("titleSelector", s.titleSelector)
+                            put("imageSelector", s.imageSelector); put("linkSelector", s.linkSelector)
+                            put("descriptionSelector", s.descriptionSelector)
+                            put("lastUpdated", s.lastUpdated ?: org.json.JSONObject.NULL)
+                            put("itemCount", s.itemCount); put("profileStatus", s.profileStatus)
+                        }
+                    )
+                }
+                val itemsJson = org.json.JSONArray()
+                for (it in allItems.value) {
+                    itemsJson.put(
+                        org.json.JSONObject().apply {
+                            put("siteId", it.siteId); put("title", it.title); put("url", it.url)
+                            put("imageUrl", it.imageUrl ?: org.json.JSONObject.NULL)
+                            put("description", it.description ?: org.json.JSONObject.NULL)
+                            put("category", it.category)
+                            put("year", it.year ?: org.json.JSONObject.NULL)
+                            put("rating", it.rating ?: org.json.JSONObject.NULL)
+                            put("sortOrder", it.sortOrder); put("isFavorite", it.isFavorite)
+                            put("scrapedAt", it.scrapedAt)
+                        }
+                    )
+                }
+                val root = org.json.JSONObject().apply {
+                    put("version", 1); put("exportedAt", System.currentTimeMillis())
+                    put("sites", sitesJson); put("items", itemsJson)
+                }
+                context.contentResolver.openOutputStream(uri)?.use { out -> out.write(root.toString(2).toByteArray()) }
+                    ?: throw Exception("Dosya açılamadı")
+                withContext(Dispatchers.Main) { message = "Yedek kaydedildi: ${sitesJson.length()} site, ${itemsJson.length()} içerik." }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) { message = "Yedekleme başarısız: ${e.message ?: "bilinmeyen hata"}" }
+            }
+        }
+    }
+
+    /** Seçilen JSON yedeğini okur; mevcut TÜM site ve içerik verilerinin yerine geçer. */
+    fun importBackup(context: Context, uri: Uri) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val text = context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
+                    ?: throw Exception("Dosya okunamadı")
+                val root = org.json.JSONObject(text)
+                val sitesJson = root.getJSONArray("sites")
+                val itemsJson = root.getJSONArray("items")
+
+                for (s in sites.value) { db.itemDao().deleteForSite(s.id); db.siteDao().delete(s) }
+
+                val oldIdToNewId = mutableMapOf<Long, Long>()
+                for (i in 0 until sitesJson.length()) {
+                    val o = sitesJson.getJSONObject(i)
+                    val newId = db.siteDao().insert(
+                        SiteEntity(
+                            name = o.getString("name"), url = o.getString("url"),
+                            itemSelector = o.optString("itemSelector", ""), titleSelector = o.optString("titleSelector", ""),
+                            imageSelector = o.optString("imageSelector", ""), linkSelector = o.optString("linkSelector", "a[href]"),
+                            descriptionSelector = o.optString("descriptionSelector", ""),
+                            lastUpdated = if (o.isNull("lastUpdated")) null else o.optLong("lastUpdated"),
+                            itemCount = o.optInt("itemCount", 0), profileStatus = o.optString("profileStatus", "Yeni")
+                        )
+                    )
+                    oldIdToNewId[o.optLong("id")] = newId
+                }
+                val newItems = mutableListOf<ScrapedItemEntity>()
+                for (i in 0 until itemsJson.length()) {
+                    val o = itemsJson.getJSONObject(i)
+                    val newSiteId = oldIdToNewId[o.optLong("siteId")] ?: continue
+                    newItems += ScrapedItemEntity(
+                        siteId = newSiteId, title = o.getString("title"), url = o.getString("url"),
+                        imageUrl = if (o.isNull("imageUrl")) null else o.optString("imageUrl"),
+                        description = if (o.isNull("description")) null else o.optString("description"),
+                        category = o.optString("category", "Diğer"),
+                        year = if (o.isNull("year")) null else o.optString("year"),
+                        rating = if (o.isNull("rating")) null else o.optString("rating"),
+                        sortOrder = o.optInt("sortOrder", 0), isFavorite = o.optBoolean("isFavorite", false),
+                        scrapedAt = o.optLong("scrapedAt", System.currentTimeMillis())
+                    )
+                }
+                if (newItems.isNotEmpty()) db.itemDao().insertAll(newItems)
+                withContext(Dispatchers.Main) { message = "Yedek geri yüklendi: ${sitesJson.length()} site, ${newItems.size} içerik." }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) { message = "Geri yükleme başarısız: ${e.message ?: "bilinmeyen hata"}" }
+            }
+        }
+    }
+
     private val downloadJobs = mutableMapOf<Long, kotlinx.coroutines.Job>()
     private var localServer: LocalFileServer? = null
     private fun downloadsRoot(context: Context): File = File(context.getExternalFilesDir(null), "downloads").apply { mkdirs() }
@@ -851,7 +994,7 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
     var detailInfo by mutableStateOf<PageAnalysis?>(null); private set
     var detailInfoBusy by mutableStateOf(false); private set
     fun openDetail(item: ScrapedItemEntity) {
-        detailItem = item; detailInfo = null; detailInfoBusy = true
+        detailItem = item; detailInfo = null; detailInfoBusy = true; resetTranslationState()
         viewModelScope.launch(Dispatchers.IO) {
             val info = analyzePage(item.url)
             withContext(Dispatchers.Main) { detailInfoBusy = false; detailInfo = info }
@@ -1160,7 +1303,7 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
 }
 
 class VmFactory(private val context: Context): ViewModelProvider.Factory { override fun <T:ViewModel> create(c:Class<T>):T { @Suppress("UNCHECKED_CAST") return ScrapeViewModel(AppDatabase.get(context)) as T } }
-enum class Page { Home, Sites, Watch, Downloads, Settings }
+enum class Page { Home, Sites, Watch, Favorites, Downloads, Settings }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable fun App(vm:ScrapeViewModel=viewModel(factory=VmFactory(LocalContext.current))) {
@@ -1180,6 +1323,7 @@ enum class Page { Home, Sites, Watch, Downloads, Settings }
                     NavigationBarItem(page == Page.Home, { page = Page.Home }, icon = { Icon(Icons.Default.Home, null) }, label = { Text("Ana") })
                     NavigationBarItem(page == Page.Sites, { page = Page.Sites }, icon = { Icon(Icons.Default.Language, null) }, label = { Text("Siteler") })
                     NavigationBarItem(page == Page.Watch, { page = Page.Watch }, icon = { Icon(Icons.Default.PlayArrow, null) }, label = { Text("İçerikler") })
+                    NavigationBarItem(page == Page.Favorites, { page = Page.Favorites }, icon = { Icon(Icons.Default.Favorite, null) }, label = { Text("Beğenilen") })
                     NavigationBarItem(page == Page.Downloads, { page = Page.Downloads }, icon = { Icon(Icons.Default.Download, null) }, label = { Text("İndirilenler") })
                     NavigationBarItem(page == Page.Settings, { page = Page.Settings }, icon = { Icon(Icons.Default.Settings, null) }, label = { Text("Ayarlar") })
                 }
@@ -1190,8 +1334,9 @@ enum class Page { Home, Sites, Watch, Downloads, Settings }
                     Page.Home -> HomeScreen(vm) { page = Page.Sites }
                     Page.Sites -> SitesScreen(vm, { add = true }, { editor = it }) { s -> vm.setWatchFilter(s.id); page = Page.Watch }
                     Page.Watch -> WatchScreen(vm)
+                    Page.Favorites -> FavoritesScreen(vm)
                     Page.Downloads -> DownloadsScreen(vm)
-                    Page.Settings -> SettingsScreen()
+                    Page.Settings -> SettingsScreen(vm)
                 }
             }
         }
@@ -1208,7 +1353,8 @@ enum class Page { Home, Sites, Watch, Downloads, Settings }
                 { html,item,title,image,link,desc -> vm.updateLivePreview(html,item,title,image,link,desc) }
             )
         }
-        if(preview){} 
+        if(preview){}
+        GlobalDialogs(vm, LocalContext.current)
     }
 }
 
@@ -1292,13 +1438,17 @@ enum class Page { Home, Sites, Watch, Downloads, Settings }
                 }
                 item(key = "row-${section.header}") {
                     LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.padding(bottom = 4.dp)) {
-                        items(section.list, key = { it.id }) { it2 -> PosterCard(context, it2) { vm.openDetail(it2) } }
+                        items(section.list, key = { it.id }) { it2 -> PosterCard(context, it2, { vm.toggleFavorite(it2) }) { vm.openDetail(it2) } }
                     }
                 }
             }
             item { Spacer(Modifier.height(12.dp)) }
         }
     }
+}
+
+@Composable
+fun GlobalDialogs(vm: ScrapeViewModel, context: Context) {
     vm.episodeParent?.let { parent ->
         AlertDialog(
             onDismissRequest = { vm.closeEpisodes() },
@@ -1380,25 +1530,38 @@ enum class Page { Home, Sites, Watch, Downloads, Settings }
 }
 
 @Composable
-private fun PosterCard(context: Context, item: ScrapedItemEntity, onClick: () -> Unit) {
+private fun PosterCard(context: Context, item: ScrapedItemEntity, onToggleFavorite: () -> Unit, onClick: () -> Unit) {
     Column(modifier = Modifier.width(118.dp).clickable { onClick() }) {
-        if (!item.imageUrl.isNullOrBlank()) {
-            AsyncImage(
-                model = coil.request.ImageRequest.Builder(context)
-                    .data(item.imageUrl)
-                    .addHeader("User-Agent", "Mozilla/5.0 (Android) ScrapeFlix/0.14")
-                    .addHeader("Referer", refererFor(item.url))
-                    .crossfade(true)
-                    .build(),
-                contentDescription = item.title,
-                contentScale = androidx.compose.ui.layout.ContentScale.Crop,
-                modifier = Modifier.fillMaxWidth().height(168.dp).clip(RoundedCornerShape(8.dp))
-            )
-        } else {
-            Box(
-                Modifier.fillMaxWidth().height(168.dp).clip(RoundedCornerShape(8.dp)).background(Color(0xFF232323)),
-                contentAlignment = Alignment.Center
-            ) { Icon(Icons.Default.Movie, null, tint = Color(0xFF555555)) }
+        Box {
+            if (!item.imageUrl.isNullOrBlank()) {
+                AsyncImage(
+                    model = coil.request.ImageRequest.Builder(context)
+                        .data(item.imageUrl)
+                        .addHeader("User-Agent", "Mozilla/5.0 (Android) ScrapeFlix/0.19")
+                        .addHeader("Referer", refererFor(item.url))
+                        .crossfade(true)
+                        .build(),
+                    contentDescription = item.title,
+                    contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+                    modifier = Modifier.fillMaxWidth().height(168.dp).clip(RoundedCornerShape(8.dp))
+                )
+            } else {
+                Box(
+                    Modifier.fillMaxWidth().height(168.dp).clip(RoundedCornerShape(8.dp)).background(Color(0xFF232323)),
+                    contentAlignment = Alignment.Center
+                ) { Icon(Icons.Default.Movie, null, tint = Color(0xFF555555)) }
+            }
+            IconButton(
+                onClick = onToggleFavorite,
+                modifier = Modifier.align(Alignment.TopEnd).size(30.dp).padding(2.dp)
+            ) {
+                Icon(
+                    if (item.isFavorite) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
+                    contentDescription = "Beğen",
+                    tint = if (item.isFavorite) Color(0xFFE50914) else Color.White,
+                    modifier = Modifier.size(20.dp)
+                )
+            }
         }
         Spacer(Modifier.height(6.dp))
         Text(item.title, fontSize = 12.sp, fontWeight = FontWeight.Medium, maxLines = 2, color = Color.White)
@@ -1440,7 +1603,16 @@ private fun DetailDialog(vm: ScrapeViewModel, context: Context, item: ScrapedIte
                     )
                 }
                 Column(Modifier.padding(18.dp)) {
-                    Text(item.title, fontSize = 20.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                    Row(verticalAlignment = Alignment.Top) {
+                        Text(item.title, fontSize = 20.sp, fontWeight = FontWeight.Bold, color = Color.White, modifier = Modifier.weight(1f))
+                        IconButton(onClick = { vm.toggleFavorite(item) }, modifier = Modifier.size(30.dp)) {
+                            Icon(
+                                if (item.isFavorite) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
+                                contentDescription = "Beğen",
+                                tint = if (item.isFavorite) Color(0xFFE50914) else Color.White
+                            )
+                        }
+                    }
                     Spacer(Modifier.height(6.dp))
                     if (year != null || rating != null) {
                         Row {
@@ -1459,7 +1631,30 @@ private fun DetailDialog(vm: ScrapeViewModel, context: Context, item: ScrapedIte
                             Text("Özet aranıyor...", color = Color.Gray, fontSize = 13.sp)
                         }
                     } else {
-                        Text(description ?: "Özet bulunamadı.", color = Color.LightGray, fontSize = 14.sp)
+                        val shownText = if (vm.showingTranslation && vm.translatedDescription != null) vm.translatedDescription!! else (description ?: "Özet bulunamadı.")
+                        Text(shownText, color = Color.LightGray, fontSize = 14.sp)
+                        if (!description.isNullOrBlank()) {
+                            Spacer(Modifier.height(6.dp))
+                            if (vm.translating) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    CircularProgressIndicator(Modifier.size(12.dp), strokeWidth = 2.dp)
+                                    Spacer(Modifier.width(6.dp))
+                                    Text("Çevriliyor...", color = Color.Gray, fontSize = 11.sp)
+                                }
+                            } else if (vm.translatedDescription != null) {
+                                TextButton(onClick = { vm.toggleTranslationView() }, contentPadding = PaddingValues(0.dp)) {
+                                    Icon(Icons.Default.Translate, null, modifier = Modifier.size(14.dp), tint = Color(0xFFD4AF37))
+                                    Spacer(Modifier.width(4.dp))
+                                    Text(if (vm.showingTranslation) "Orijinali Göster" else "Çeviriyi Göster", color = Color(0xFFD4AF37), fontSize = 12.sp)
+                                }
+                            } else {
+                                TextButton(onClick = { vm.translateDetailDescription(item, description) }, contentPadding = PaddingValues(0.dp)) {
+                                    Icon(Icons.Default.Translate, null, modifier = Modifier.size(14.dp), tint = Color(0xFFD4AF37))
+                                    Spacer(Modifier.width(4.dp))
+                                    Text("Türkçeye Çevir", color = Color(0xFFD4AF37), fontSize = 12.sp)
+                                }
+                            }
+                        }
                     }
                     Spacer(Modifier.height(18.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
@@ -1652,6 +1847,26 @@ fun SiteEditorDialog(
 
 @Composable fun AddSiteDialog(onDismiss:()->Unit,onAdd:(String,String)->Unit){var n by remember{mutableStateOf("")};var u by remember{mutableStateOf("")};AlertDialog(onDismissRequest=onDismiss,title={Text("Yeni Site Ekle")},text={Column(verticalArrangement=Arrangement.spacedBy(10.dp)){OutlinedTextField(n,{n=it},label={Text("Site adı")});OutlinedTextField(u,{u=it},label={Text("Site adresi")})}},confirmButton={Button({onAdd(n,u)},enabled=u.isNotBlank()){Text("Kaydet")}},dismissButton={TextButton(onDismiss){Text("İptal")}})}
 
+@Composable fun FavoritesScreen(vm: ScrapeViewModel) {
+    val favorites by vm.favorites.collectAsState()
+    val context = LocalContext.current
+    Column(Modifier.fillMaxSize().padding(16.dp)) {
+        Text("Beğenilenler", fontSize = 28.sp, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(4.dp))
+        Text("Kalp işaretlediğin içerikler, buradan seçip izleyebilirsin", color = Color.Gray, fontSize = 12.sp)
+        Spacer(Modifier.height(14.dp))
+        if (favorites.isEmpty()) {
+            Text("Henüz beğenilen içerik yok. Bir postere dokun, kalp simgesine bas.", color = Color.Gray)
+        } else {
+            LazyVerticalGrid(columns = GridCells.Adaptive(minSize = 118.dp), verticalArrangement = Arrangement.spacedBy(14.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                items(favorites, key = { it.id }) { it2 ->
+                    PosterCard(context, it2, { vm.toggleFavorite(it2) }) { vm.openDetail(it2) }
+                }
+            }
+        }
+    }
+}
+
 @Composable fun DownloadsScreen(vm: ScrapeViewModel) {
     val downloads by vm.downloads.collectAsState()
     val context = LocalContext.current
@@ -1703,21 +1918,29 @@ fun SiteEditorDialog(
     }
 }
 
-@Composable fun SettingsScreen() {
+@Composable fun SettingsScreen(vm: ScrapeViewModel = viewModel(factory = VmFactory(LocalContext.current))) {
     val context = LocalContext.current
     var lockActive by remember { mutableStateOf(LockPrefs.isLockActive(context)) }
     var showSetup by remember { mutableStateOf(false) }
     var showChange by remember { mutableStateOf(false) }
     var showDisable by remember { mutableStateOf(false) }
-    Column(Modifier.fillMaxSize().padding(20.dp)) {
+    var showRestoreConfirm by remember { mutableStateOf(false) }
+    val exportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
+        if (uri != null) vm.exportBackup(context, uri)
+    }
+    val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) vm.importBackup(context, uri)
+    }
+    Column(Modifier.fillMaxSize().padding(20.dp).verticalScroll(rememberScrollState())) {
         Text("Ayarlar", fontSize = 28.sp, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(16.dp))
-        Text("ScrapeFlix v0.18.0", fontWeight = FontWeight.Bold)
+        Text("ScrapeFlix v0.19.0", fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(8.dp))
         Text(
-            "v0.18: Uygulamaya şifreli kilit eklendi — açılışta ve arka plandan dönüşte şifre isteniyor.",
+            "v0.19: Kilit artık sadece uygulama gerçekten kapatılıp açılınca soruluyor. Yedekleme/geri yükleme, özet çevirisi ve beğenilenler listesi eklendi.",
             color = Color.Gray
         )
+        if (vm.message.isNotBlank()) { Spacer(Modifier.height(10.dp)); Text(vm.message, color = Color.LightGray, fontSize = 12.sp) }
         Spacer(Modifier.height(28.dp))
         HorizontalDivider(color = Color(0xFF2A2A2A))
         Spacer(Modifier.height(20.dp))
@@ -1740,6 +1963,25 @@ fun SiteEditorDialog(
         } else {
             Button({ showSetup = true }) {
                 Icon(Icons.Default.Lock, null); Spacer(Modifier.width(6.dp)); Text("Kilidi Etkinleştir")
+            }
+        }
+        Spacer(Modifier.height(28.dp))
+        HorizontalDivider(color = Color(0xFF2A2A2A))
+        Spacer(Modifier.height(20.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Default.Backup, null, tint = Color(0xFFD4AF37))
+            Spacer(Modifier.width(8.dp))
+            Text("Yedekleme", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+        }
+        Spacer(Modifier.height(6.dp))
+        Text("Sitelerini ve taranan içerikleri bir dosyaya kaydet, istediğin zaman geri yükle.", color = Color.Gray, fontSize = 12.sp)
+        Spacer(Modifier.height(12.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton({ exportLauncher.launch("scrapeflix_yedek_${System.currentTimeMillis()}.json") }) {
+                Icon(Icons.Default.Upload, null); Spacer(Modifier.width(6.dp)); Text("Dışa Aktar")
+            }
+            OutlinedButton({ showRestoreConfirm = true }) {
+                Icon(Icons.Default.Download, null); Spacer(Modifier.width(6.dp)); Text("Geri Yükle")
             }
         }
     }
@@ -1769,6 +2011,17 @@ fun SiteEditorDialog(
         ) {
             LockPrefs.disable(context); lockActive = false; showDisable = false
         }
+    }
+    if (showRestoreConfirm) {
+        AlertDialog(
+            onDismissRequest = { showRestoreConfirm = false },
+            title = { Text("Yedeği Geri Yükle") },
+            text = { Text("Bu işlem mevcut TÜM site ve içerik verilerini silip yedek dosyasındakilerle değiştirecek. Devam edilsin mi?") },
+            confirmButton = {
+                TextButton({ showRestoreConfirm = false; importLauncher.launch(arrayOf("application/json")) }) { Text("Devam Et") }
+            },
+            dismissButton = { TextButton({ showRestoreConfirm = false }) { Text("Vazgeç") } }
+        )
     }
 }
 
@@ -1874,17 +2127,10 @@ private fun PasswordActionDialog(
 @Composable
 fun AppRoot() {
     val context = LocalContext.current
+    // Kilit sadece uygulama süreci yeniden başladığında (gerçekten kapatılıp açıldığında)
+    // devreye girer. Sadece arka plana alınıp geri dönüldüğünde (uygulama öldürülmediyse)
+    // durum hafızada kaldığı için tekrar şifre sormaz, kaldığı yerden devam eder.
     var unlocked by remember { mutableStateOf(!LockPrefs.isLockActive(context)) }
-    val lifecycleOwner = LocalLifecycleOwner.current
-    DisposableEffect(lifecycleOwner) {
-        val observer = LifecycleEventObserver { _, event ->
-            // Uygulama arka plana her gittiğinde tekrar kilitlenir (kilit etkinse) — WhatsApp/
-            // banka uygulamaları tarzı gerçek bir kilit davranışı için.
-            if (event == Lifecycle.Event.ON_STOP && LockPrefs.isLockActive(context)) unlocked = false
-        }
-        lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
-    }
     MaterialTheme(colorScheme = darkColorScheme(background = Color(0xFF080808), surface = Color(0xFF151515), primary = Color(0xFFE50914))) {
         if (unlocked) App() else LockScreen { unlocked = true }
     }

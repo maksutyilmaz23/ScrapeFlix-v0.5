@@ -30,6 +30,7 @@ data class ScrapedItemEntity(
     val year: String? = null,
     val rating: String? = null,
     val sortOrder: Int = 0,
+    val isFavorite: Boolean = false,
     val scrapedAt: Long = System.currentTimeMillis()
 )
 

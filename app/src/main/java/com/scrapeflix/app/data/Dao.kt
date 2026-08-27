@@ -18,6 +18,10 @@ interface ItemDao {
     fun observeForSite(siteId: Long): Flow<List<ScrapedItemEntity>>
     @Query("SELECT * FROM scraped_items ORDER BY category COLLATE NOCASE, sortOrder")
     fun observeAll(): Flow<List<ScrapedItemEntity>>
+    @Query("SELECT * FROM scraped_items WHERE isFavorite = 1 ORDER BY category COLLATE NOCASE, sortOrder")
+    fun observeFavorites(): Flow<List<ScrapedItemEntity>>
+    @Query("UPDATE scraped_items SET isFavorite = :fav WHERE id = :id")
+    suspend fun setFavorite(id: Long, fav: Boolean)
     @Insert suspend fun insertAll(items: List<ScrapedItemEntity>)
     @Query("DELETE FROM scraped_items WHERE siteId = :siteId") suspend fun deleteForSite(siteId: Long)
 }
