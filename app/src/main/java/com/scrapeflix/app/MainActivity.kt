@@ -21,6 +21,8 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -30,10 +32,15 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
@@ -1696,6 +1703,191 @@ fun SiteEditorDialog(
     }
 }
 
-@Composable fun SettingsScreen(){Column(Modifier.fillMaxSize().padding(20.dp)){Text("Ayarlar",fontSize=28.sp,fontWeight=FontWeight.Bold);Spacer(Modifier.height(16.dp));Text("ScrapeFlix v0.17.0",fontWeight=FontWeight.Bold);Spacer(Modifier.height(8.dp));Text("v0.17: İçerikleri indirip çevrimdışı izleyebilirsin — akış linki listesindeki indir simgesine dokun, İndirilenler sekmesinden ilerlemeyi takip et ve tamamlanınca Oynat'a bas.",color=Color.Gray)}}
+@Composable fun SettingsScreen() {
+    val context = LocalContext.current
+    var lockActive by remember { mutableStateOf(LockPrefs.isLockActive(context)) }
+    var showSetup by remember { mutableStateOf(false) }
+    var showChange by remember { mutableStateOf(false) }
+    var showDisable by remember { mutableStateOf(false) }
+    Column(Modifier.fillMaxSize().padding(20.dp)) {
+        Text("Ayarlar", fontSize = 28.sp, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(16.dp))
+        Text("ScrapeFlix v0.18.0", fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(8.dp))
+        Text(
+            "v0.18: Uygulamaya şifreli kilit eklendi — açılışta ve arka plandan dönüşte şifre isteniyor.",
+            color = Color.Gray
+        )
+        Spacer(Modifier.height(28.dp))
+        HorizontalDivider(color = Color(0xFF2A2A2A))
+        Spacer(Modifier.height(20.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Default.Lock, null, tint = Color(0xFFE50914))
+            Spacer(Modifier.width(8.dp))
+            Text("Uygulama Kilidi", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+        }
+        Spacer(Modifier.height(6.dp))
+        Text(
+            if (lockActive) "Uygulama şifreyle korunuyor." else "Uygulama açıldığında şifre istenmiyor.",
+            color = Color.Gray, fontSize = 12.sp
+        )
+        Spacer(Modifier.height(12.dp))
+        if (lockActive) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton({ showChange = true }) { Text("Şifreyi Değiştir") }
+                OutlinedButton({ showDisable = true }) { Text("Kilidi Kapat") }
+            }
+        } else {
+            Button({ showSetup = true }) {
+                Icon(Icons.Default.Lock, null); Spacer(Modifier.width(6.dp)); Text("Kilidi Etkinleştir")
+            }
+        }
+    }
+    if (showSetup) {
+        PasswordActionDialog(
+            context = context, requireCurrent = false, requireNew = true,
+            title = "Kilidi Etkinleştir", confirmText = "Kaydet",
+            onDismiss = { showSetup = false }
+        ) { newPass ->
+            LockPrefs.setPassword(context, newPass!!); lockActive = true; showSetup = false
+        }
+    }
+    if (showChange) {
+        PasswordActionDialog(
+            context = context, requireCurrent = true, requireNew = true,
+            title = "Şifreyi Değiştir", confirmText = "Güncelle",
+            onDismiss = { showChange = false }
+        ) { newPass ->
+            LockPrefs.setPassword(context, newPass!!); showChange = false
+        }
+    }
+    if (showDisable) {
+        PasswordActionDialog(
+            context = context, requireCurrent = true, requireNew = false,
+            title = "Kilidi Kapat", confirmText = "Kapat",
+            onDismiss = { showDisable = false }
+        ) {
+            LockPrefs.disable(context); lockActive = false; showDisable = false
+        }
+    }
+}
 
-class MainActivity:ComponentActivity(){override fun onCreate(b:Bundle?){super.onCreate(b);setContent{App()}}}
+/** Basit bir uygulama kilidi: şifre SHA-256 hash'i olarak SharedPreferences'ta tutulur,
+ *  düz metin olarak asla saklanmaz. */
+object LockPrefs {
+    private const val PREF = "scrapeflix_lock"
+    private const val KEY_HASH = "hash"
+    private const val KEY_ENABLED = "enabled"
+    private fun prefs(context: Context) = context.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+    private fun hash(pass: String): String =
+        java.security.MessageDigest.getInstance("SHA-256").digest(pass.toByteArray()).joinToString("") { "%02x".format(it) }
+
+    fun isSet(context: Context): Boolean = prefs(context).getString(KEY_HASH, null) != null
+    fun isLockActive(context: Context): Boolean = isSet(context) && prefs(context).getBoolean(KEY_ENABLED, false)
+    fun verify(context: Context, pass: String): Boolean = prefs(context).getString(KEY_HASH, null) == hash(pass)
+    fun setPassword(context: Context, pass: String) {
+        prefs(context).edit().putString(KEY_HASH, hash(pass)).putBoolean(KEY_ENABLED, true).apply()
+    }
+    fun disable(context: Context) { prefs(context).edit().putBoolean(KEY_ENABLED, false).apply() }
+}
+
+@Composable
+fun LockScreen(onUnlocked: () -> Unit) {
+    val context = LocalContext.current
+    var pass by remember { mutableStateOf("") }
+    var error by remember { mutableStateOf<String?>(null) }
+    fun tryUnlock() { if (LockPrefs.verify(context, pass)) onUnlocked() else error = "Yanlış şifre" }
+    Box(Modifier.fillMaxSize().background(Color(0xFF080808)), contentAlignment = Alignment.Center) {
+        Column(Modifier.padding(28.dp).widthIn(max = 360.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Icon(Icons.Default.Lock, null, tint = Color(0xFFE50914), modifier = Modifier.size(48.dp))
+            Spacer(Modifier.height(16.dp))
+            Text("SCRAPEFLIX", fontWeight = FontWeight.Bold, fontSize = 22.sp, color = Color.White)
+            Spacer(Modifier.height(6.dp))
+            Text("Devam etmek için şifreni gir", color = Color.Gray, fontSize = 13.sp)
+            Spacer(Modifier.height(24.dp))
+            OutlinedTextField(
+                value = pass,
+                onValueChange = { pass = it; error = null },
+                label = { Text("Şifre") },
+                visualTransformation = PasswordVisualTransformation(),
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                keyboardActions = KeyboardActions(onDone = { tryUnlock() }),
+                modifier = Modifier.fillMaxWidth()
+            )
+            error?.let { Spacer(Modifier.height(8.dp)); Text(it, color = Color(0xFFE57373), fontSize = 12.sp) }
+            Spacer(Modifier.height(18.dp))
+            Button(onClick = { tryUnlock() }, modifier = Modifier.fillMaxWidth()) {
+                Icon(Icons.Default.LockOpen, null); Spacer(Modifier.width(8.dp)); Text("Kilidi Aç")
+            }
+        }
+    }
+}
+
+/** Kilit etkinleştirme, şifre değiştirme ve kilit kapatma için ortak diyalog.
+ *  requireCurrent: mevcut şifrenin doğrulanması gerekiyor mu; requireNew: yeni şifre isteniyor mu. */
+@Composable
+private fun PasswordActionDialog(
+    context: Context,
+    requireCurrent: Boolean,
+    requireNew: Boolean,
+    title: String,
+    confirmText: String,
+    onDismiss: () -> Unit,
+    onSuccess: (newPassword: String?) -> Unit
+) {
+    var current by remember { mutableStateOf("") }
+    var newPass by remember { mutableStateOf("") }
+    var confirmPass by remember { mutableStateOf("") }
+    var error by remember { mutableStateOf<String?>(null) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = {
+            Column {
+                if (requireCurrent) {
+                    OutlinedTextField(current, { current = it; error = null }, label = { Text("Mevcut şifre") }, visualTransformation = PasswordVisualTransformation(), singleLine = true, modifier = Modifier.fillMaxWidth())
+                    if (requireNew) Spacer(Modifier.height(8.dp))
+                }
+                if (requireNew) {
+                    OutlinedTextField(newPass, { newPass = it; error = null }, label = { Text("Yeni şifre") }, visualTransformation = PasswordVisualTransformation(), singleLine = true, modifier = Modifier.fillMaxWidth())
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(confirmPass, { confirmPass = it; error = null }, label = { Text("Yeni şifre (tekrar)") }, visualTransformation = PasswordVisualTransformation(), singleLine = true, modifier = Modifier.fillMaxWidth())
+                }
+                error?.let { Spacer(Modifier.height(8.dp)); Text(it, color = Color(0xFFE57373), fontSize = 12.sp) }
+            }
+        },
+        confirmButton = {
+            TextButton({
+                if (requireCurrent && !LockPrefs.verify(context, current)) { error = "Mevcut şifre yanlış"; return@TextButton }
+                if (requireNew) {
+                    if (newPass.length < 4) { error = "Şifre en az 4 karakter olmalı"; return@TextButton }
+                    if (newPass != confirmPass) { error = "Şifreler eşleşmiyor"; return@TextButton }
+                    onSuccess(newPass)
+                } else onSuccess(null)
+            }) { Text(confirmText) }
+        },
+        dismissButton = { TextButton(onDismiss) { Text("Vazgeç") } }
+    )
+}
+
+@Composable
+fun AppRoot() {
+    val context = LocalContext.current
+    var unlocked by remember { mutableStateOf(!LockPrefs.isLockActive(context)) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            // Uygulama arka plana her gittiğinde tekrar kilitlenir (kilit etkinse) — WhatsApp/
+            // banka uygulamaları tarzı gerçek bir kilit davranışı için.
+            if (event == Lifecycle.Event.ON_STOP && LockPrefs.isLockActive(context)) unlocked = false
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    MaterialTheme(colorScheme = darkColorScheme(background = Color(0xFF080808), surface = Color(0xFF151515), primary = Color(0xFFE50914))) {
+        if (unlocked) App() else LockScreen { unlocked = true }
+    }
+}
+
+class MainActivity:ComponentActivity(){override fun onCreate(b:Bundle?){super.onCreate(b);setContent{AppRoot()}}}
