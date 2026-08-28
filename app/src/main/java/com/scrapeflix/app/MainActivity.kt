@@ -1491,7 +1491,7 @@ fun GlobalDialogs(vm: ScrapeViewModel, context: Context) {
             confirmButton = { TextButton({ vm.closeStreamPicker() }) { Text("Kapat") } },
             title = { Text("Akış Linkleri") },
             text = {
-                Column(Modifier.heightIn(max = 420.dp)) {
+                Column(Modifier.heightIn(max = 520.dp)) {
                     Text(title, color = Color.Gray, fontSize = 12.sp)
                     Spacer(Modifier.height(8.dp))
                     if (vm.streamBusy) {
@@ -1513,7 +1513,7 @@ fun GlobalDialogs(vm: ScrapeViewModel, context: Context) {
                                     Spacer(Modifier.width(8.dp))
                                     Column(Modifier.weight(1f)) {
                                         Text(c.label, fontWeight = FontWeight.Medium)
-                                        Text(c.url, color = Color.Gray, fontSize = 10.sp, maxLines = 1)
+                                        Text(c.url, color = Color.Gray, fontSize = 11.sp, softWrap = true)
                                     }
                                     IconButton({ vm.startDownload(context, "$title — ${c.label}", c.url) }) {
                                         Icon(Icons.Default.Download, "İndir", tint = Color(0xFFD4AF37))
@@ -1934,10 +1934,10 @@ fun SiteEditorDialog(
     Column(Modifier.fillMaxSize().padding(20.dp).verticalScroll(rememberScrollState())) {
         Text("Ayarlar", fontSize = 28.sp, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(16.dp))
-        Text("ScrapeFlix v0.19.0", fontWeight = FontWeight.Bold)
+        Text("ScrapeFlix v0.20.0", fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(8.dp))
         Text(
-            "v0.19: Kilit artık sadece uygulama gerçekten kapatılıp açılınca soruluyor. Yedekleme/geri yükleme, özet çevirisi ve beğenilenler listesi eklendi.",
+            "v0.20: Akış linki listesindeki URL'ler artık kısaltılmadan tam metin olarak gösteriliyor.",
             color = Color.Gray
         )
         if (vm.message.isNotBlank()) { Spacer(Modifier.height(10.dp)); Text(vm.message, color = Color.LightGray, fontSize = 12.sp) }
