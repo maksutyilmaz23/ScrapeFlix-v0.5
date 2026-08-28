@@ -15,7 +15,8 @@ data class SiteEntity(
     val descriptionSelector: String = "",
     val lastUpdated: Long? = null,
     val itemCount: Int = 0,
-    val profileStatus: String = "Yeni"
+    val profileStatus: String = "Yeni",
+    val hidden: Boolean = false
 )
 
 @Entity(tableName = "scraped_items")

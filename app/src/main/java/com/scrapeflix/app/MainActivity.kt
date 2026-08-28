@@ -491,17 +491,21 @@ private fun guessStreamLabel(url: String, index: Int): String {
 
 /** İçerik sayfasını tek seferde analiz eder: özet, yıl, puan ve bulunabilen TÜM akış linki
  *  adaylarını (birden fazla sunucu/kalite seçeneği olabilir) birlikte döndürür. */
-/** Verilen metni Türkçeye çevirir (kaynak dil otomatik algılanır). Ek kütüphane/API anahtarı
- *  gerektirmeyen, tarayıcıların da kullandığı genel çeviri uç noktası üzerinden çalışır. */
-private fun translateToTurkish(text: String): String? {
-    if (text.isBlank()) return null
+/** translate.googleapis.com'un tarayıcıların da kullandığı resmi olmayan uç noktası —
+ *  ek kütüphane/API anahtarı gerektirmez ama bazı ağlarda/IP'lerde engellenebilir veya
+ *  ara sıra beklenmeyen içerik dönebilir. */
+private fun translateViaGoogle(text: String): String? {
     return try {
         val encoded = java.net.URLEncoder.encode(text.take(3000), "UTF-8")
         val url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=tr&dt=t&q=$encoded"
-        val body = (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply {
+        val conn = (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply {
+            instanceFollowRedirects = true
             connectTimeout = 10000; readTimeout = 10000
-            setRequestProperty("User-Agent", "Mozilla/5.0 (Android) ScrapeFlix/0.19")
-        }.inputStream.bufferedReader().use { it.readText() }
+            setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+            setRequestProperty("Accept", "*/*")
+        }
+        if (conn.responseCode !in 200..299) return null
+        val body = conn.inputStream.bufferedReader().use { it.readText() }
         val segments = org.json.JSONArray(body).getJSONArray(0)
         val sb = StringBuilder()
         for (i in 0 until segments.length()) {
@@ -509,6 +513,32 @@ private fun translateToTurkish(text: String): String? {
         }
         sb.toString().trim().ifBlank { null }
     } catch (e: Exception) { null }
+}
+
+/** Google uç noktası engelliyse veya erişilemiyorsa devreye giren ikinci, bağımsız bir
+ *  çeviri servisi (farklı sunucu — bir tanesi engellense bile diğeri çoğu zaman çalışır). */
+private fun translateViaMyMemory(text: String): String? {
+    return try {
+        val encoded = java.net.URLEncoder.encode(text.take(490), "UTF-8")
+        val url = "https://api.mymemory.translated.net/get?q=$encoded&langpair=en|tr"
+        val conn = (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply {
+            instanceFollowRedirects = true
+            connectTimeout = 10000; readTimeout = 10000
+            setRequestProperty("User-Agent", "Mozilla/5.0 (Android) ScrapeFlix")
+        }
+        if (conn.responseCode !in 200..299) return null
+        val body = conn.inputStream.bufferedReader().use { it.readText() }
+        val translated = org.json.JSONObject(body).getJSONObject("responseData").optString("translatedText")
+        translated.trim().takeUnless { it.isBlank() || it.contains("MYMEMORY WARNING", ignoreCase = true) }
+    } catch (e: Exception) { null }
+}
+
+/** Verilen metni Türkçeye çevirir. Önce Google'ın tarayıcıların da kullandığı ücretsiz uç
+ *  noktasını dener; o başarısız/engelli olursa bağımsız bir ikinci servise (MyMemory) düşer —
+ *  tek bir servisin geçici olarak erişilemez olması çeviriyi tamamen durdurmasın diye. */
+private fun translateToTurkish(text: String): String? {
+    if (text.isBlank()) return null
+    return translateViaGoogle(text) ?: translateViaMyMemory(text)
 }
 
 private fun analyzePage(pageUrl: String): PageAnalysis {
@@ -810,21 +840,22 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
     var translatedDescription by mutableStateOf<String?>(null); private set
     var translating by mutableStateOf(false); private set
     var showingTranslation by mutableStateOf(false); private set
+    var translationError by mutableStateOf<String?>(null); private set
 
     fun translateDetailDescription(item: ScrapedItemEntity, text: String) {
         translationCache[item.id]?.let { translatedDescription = it; showingTranslation = true; return }
         if (translating) return
-        translating = true
+        translating = true; translationError = null
         viewModelScope.launch {
             val result = withContext(Dispatchers.IO) { translateToTurkish(text) }
             translating = false
             if (result != null) { translationCache[item.id] = result; translatedDescription = result; showingTranslation = true }
-            else message = "Çeviri başarısız oldu"
+            else translationError = "Çeviri başarısız oldu. İnternet bağlantını kontrol edip tekrar dene."
         }
     }
 
     fun toggleTranslationView() { showingTranslation = !showingTranslation }
-    fun resetTranslationState() { translatedDescription = null; showingTranslation = false }
+    fun resetTranslationState() { translatedDescription = null; showingTranslation = false; translationError = null }
 
     /** Tüm siteleri ve içerikleri okunabilir bir JSON dosyasına yazar (kullanıcı konumu seçer). */
     fun exportBackup(context: Context, uri: Uri) {
@@ -1154,9 +1185,13 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
         db.itemDao().deleteForSite(site.id); db.siteDao().delete(site)
         withContext(Dispatchers.Main) { if (selectedSiteId == site.id) selectedSiteId = null }
     }
-    fun updateProfile(site: SiteEntity, item: String, title: String, image: String, link: String, desc: String) = viewModelScope.launch(Dispatchers.IO) {
-        db.siteDao().update(site.copy(itemSelector=item, titleSelector=title, imageSelector=image, linkSelector=link, descriptionSelector=desc, profileStatus="Hazır"))
+    fun updateProfile(site: SiteEntity, name: String, url: String, item: String, title: String, image: String, link: String, desc: String) = viewModelScope.launch(Dispatchers.IO) {
+        db.siteDao().update(site.copy(name = name.trim().ifBlank { site.name }, url = normalizeUrl(url).ifBlank { site.url }, itemSelector=item, titleSelector=title, imageSelector=image, linkSelector=link, descriptionSelector=desc, profileStatus="Hazır"))
         withContext(Dispatchers.Main) { message = "Profil kaydedildi." }
+    }
+
+    fun toggleSiteHidden(site: SiteEntity) = viewModelScope.launch(Dispatchers.IO) {
+        db.siteDao().update(site.copy(hidden = !site.hidden))
     }
 
     fun analyze(site: SiteEntity) {
@@ -1349,7 +1384,7 @@ enum class Page { Home, Sites, Watch, Favorites, Downloads, Settings }
                 { vm.analyze(it); vm.loadPreviewHtml(it) },
                 { vm.scrape(it) },
                 { vm.deleteSite(it); editor=null; vm.clearPreview() },
-                { item,title,image,link,desc->vm.updateProfile(it,item,title,image,link,desc) },
+                { name,url,item,title,image,link,desc->vm.updateProfile(it,name,url,item,title,image,link,desc) },
                 { html,item,title,image,link,desc -> vm.updateLivePreview(html,item,title,image,link,desc) }
             )
         }
@@ -1360,18 +1395,21 @@ enum class Page { Home, Sites, Watch, Favorites, Downloads, Settings }
 
 @Composable fun HomeScreen(vm:ScrapeViewModel,open:()->Unit){val sites by vm.sites.collectAsState();val all by vm.allItems.collectAsState();LazyColumn(Modifier.fillMaxSize().padding(16.dp),verticalArrangement=Arrangement.spacedBy(14.dp)){item{Text("Ana Sayfa",fontSize=28.sp,fontWeight=FontWeight.Bold);Text("${sites.size} site • ${all.size} içerik",color=Color.Gray)};item{Button(open,Modifier.fillMaxWidth()){Icon(Icons.Default.Language,null);Spacer(Modifier.width(8.dp));Text("Sitelerimi Yönet")}};items(sites){s->SiteCard(s,{vm.analyze(s)},{vm.scrape(s)},{vm.deleteSite(s)})}}}
 
-@Composable fun SitesScreen(vm:ScrapeViewModel,onAdd:()->Unit,onEdit:(SiteEntity)->Unit,onOpenContent:(SiteEntity)->Unit){val sites by vm.sites.collectAsState();Column(Modifier.fillMaxSize().padding(16.dp)){Row(Modifier.fillMaxWidth(),Arrangement.SpaceBetween,Alignment.CenterVertically){Column{Text("Sitelerim",fontSize=26.sp,fontWeight=FontWeight.Bold);Text("Analiz • önizleme • profil",color=Color.Gray)};FilledTonalButton(onAdd){Icon(Icons.Default.Add,null);Text(" Ekle")}};Spacer(Modifier.height(14.dp));if(vm.busy)LinearProgressIndicator(Modifier.fillMaxWidth());if(vm.message.isNotBlank())Text(vm.message,color=Color.LightGray,modifier=Modifier.padding(vertical=8.dp));LazyColumn(verticalArrangement=Arrangement.spacedBy(10.dp)){items(sites){s->SiteCard(s,{vm.analyze(s)},{vm.scrape(s)},{vm.deleteSite(s)},{onOpenContent(s)});TextButton({onEdit(s)}){Icon(Icons.Default.Edit,null);Text(" Profil / Önizleme")}}}}}
+@Composable fun SitesScreen(vm:ScrapeViewModel,onAdd:()->Unit,onEdit:(SiteEntity)->Unit,onOpenContent:(SiteEntity)->Unit){val sites by vm.sites.collectAsState();Column(Modifier.fillMaxSize().padding(16.dp)){Row(Modifier.fillMaxWidth(),Arrangement.SpaceBetween,Alignment.CenterVertically){Column{Text("Sitelerim",fontSize=26.sp,fontWeight=FontWeight.Bold);Text("Analiz • önizleme • profil",color=Color.Gray)};FilledTonalButton(onAdd){Icon(Icons.Default.Add,null);Text(" Ekle")}};Spacer(Modifier.height(14.dp));if(vm.busy)LinearProgressIndicator(Modifier.fillMaxWidth());if(vm.message.isNotBlank())Text(vm.message,color=Color.LightGray,modifier=Modifier.padding(vertical=8.dp));LazyColumn(verticalArrangement=Arrangement.spacedBy(10.dp)){items(sites){s->SiteCard(s,{vm.analyze(s)},{vm.scrape(s)},{vm.deleteSite(s)},{vm.toggleSiteHidden(s)},{onOpenContent(s)});TextButton({onEdit(s)}){Icon(Icons.Default.Edit,null);Text(" Profil / Önizleme")}}}}}
 
-@Composable fun SiteCard(site:SiteEntity,onAnalyze:()->Unit,onScrape:()->Unit,onDelete:()->Unit,onOpenContent:()->Unit={}){Card(Modifier.fillMaxWidth(),shape=RoundedCornerShape(14.dp),colors=CardDefaults.cardColors(containerColor=Color(0xFF191919))){Column(Modifier.padding(14.dp)){Text(site.name,fontSize=19.sp,fontWeight=FontWeight.Bold);Text(site.url,color=Color.Gray,maxLines=1);Text("${site.itemCount} içerik • ${site.profileStatus}",color=Color.LightGray,fontSize=13.sp);Row(horizontalArrangement=Arrangement.spacedBy(2.dp)){TextButton(onAnalyze){Icon(Icons.Default.Search,null);Text(" Analiz")};TextButton(onScrape){Icon(Icons.Default.Refresh,null);Text(" Tara")};TextButton(onDelete){Icon(Icons.Default.Delete,null);Text(" Sil")}};if(site.itemCount>0)TextButton(onOpenContent,Modifier.fillMaxWidth()){Icon(Icons.Default.PlayArrow,null);Text(" Bu Sitenin İçeriklerini Gör (${site.itemCount})")}}}}
+@Composable fun SiteCard(site:SiteEntity,onAnalyze:()->Unit,onScrape:()->Unit,onDelete:()->Unit,onToggleHidden:()->Unit={},onOpenContent:()->Unit={}){Card(Modifier.fillMaxWidth(),shape=RoundedCornerShape(14.dp),colors=CardDefaults.cardColors(containerColor=Color(0xFF191919))){Column(Modifier.padding(14.dp)){Row(Modifier.fillMaxWidth(),Arrangement.SpaceBetween,Alignment.Top){Column(Modifier.weight(1f)){Text(site.name,fontSize=19.sp,fontWeight=FontWeight.Bold);Text(site.url,color=Color.Gray,maxLines=1)};if(site.hidden)Icon(Icons.Default.VisibilityOff,"Gizli",tint=Color.Gray,modifier=Modifier.size(18.dp))};Text("${site.itemCount} içerik • ${site.profileStatus}",color=Color.LightGray,fontSize=13.sp);Row(horizontalArrangement=Arrangement.spacedBy(2.dp)){TextButton(onAnalyze){Icon(Icons.Default.Search,null);Text(" Analiz")};TextButton(onScrape){Icon(Icons.Default.Refresh,null);Text(" Tara")};TextButton(onDelete){Icon(Icons.Default.Delete,null);Text(" Sil")}};TextButton(onToggleHidden,Modifier.fillMaxWidth()){Icon(if(site.hidden)Icons.Default.Visibility else Icons.Default.VisibilityOff,null);Text(if(site.hidden)" İçerikleri Göster" else " İçerikleri Gizle")};if(site.itemCount>0&&!site.hidden)TextButton(onOpenContent,Modifier.fillMaxWidth()){Icon(Icons.Default.PlayArrow,null);Text(" Bu Sitenin İçeriklerini Gör (${site.itemCount})")}}}}
 
 @Composable fun WatchScreen(vm: ScrapeViewModel) {
     val items by vm.allItems.collectAsState()
-    val sites by vm.sites.collectAsState()
+    val allSites by vm.sites.collectAsState()
+    val sites = remember(allSites) { allSites.filter { !it.hidden } }
+    val visibleSiteIds = remember(sites) { sites.map { it.id }.toSet() }
+    val visibleItems = remember(items, visibleSiteIds) { items.filter { it.siteId in visibleSiteIds } }
     val context = LocalContext.current
     var q by remember { mutableStateOf("") }
     var sortMode by remember { mutableStateOf("Orijinal") }
     val filterSiteId = vm.watchFilterSiteId
-    val base = items.filter {
+    val base = visibleItems.filter {
         (filterSiteId == null || it.siteId == filterSiteId) && (q.isBlank() || it.title.contains(q, true))
     }
     fun sorted(list: List<ScrapedItemEntity>): List<ScrapedItemEntity> = when (sortMode) {
@@ -1403,7 +1441,7 @@ enum class Page { Home, Sites, Watch, Favorites, Downloads, Settings }
             Spacer(Modifier.height(4.dp))
             LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 item {
-                    FilterChip(selected = filterSiteId == null, onClick = { vm.setWatchFilter(null) }, label = { Text("Tümü (${items.size})") })
+                    FilterChip(selected = filterSiteId == null, onClick = { vm.setWatchFilter(null) }, label = { Text("Tümü (${visibleItems.size})") })
                 }
                 items(sites) { s ->
                     FilterChip(selected = filterSiteId == s.id, onClick = { vm.setWatchFilter(s.id) }, label = { Text("${s.name} (${s.itemCount})") })
@@ -1653,6 +1691,10 @@ private fun DetailDialog(vm: ScrapeViewModel, context: Context, item: ScrapedIte
                                     Spacer(Modifier.width(4.dp))
                                     Text("Türkçeye Çevir", color = Color(0xFFD4AF37), fontSize = 12.sp)
                                 }
+                                vm.translationError?.let {
+                                    Spacer(Modifier.height(4.dp))
+                                    Text(it, color = Color(0xFFE57373), fontSize = 11.sp)
+                                }
                             }
                         }
                     }
@@ -1684,9 +1726,11 @@ fun SiteEditorDialog(
     onAnalyze: () -> Unit,
     onScrape: () -> Unit,
     onDelete: () -> Unit,
-    onSave: (String, String, String, String, String) -> Unit,
+    onSave: (String, String, String, String, String, String, String) -> Unit,
     onPreviewChange: (String?, String, String, String, String, String) -> Unit
 ) {
+    var name by remember(site.id) { mutableStateOf(site.name) }
+    var url by remember(site.id) { mutableStateOf(site.url) }
     var item by remember(site.id, site.itemSelector) { mutableStateOf(site.itemSelector) }
     var title by remember(site.id, site.titleSelector) { mutableStateOf(site.titleSelector) }
     var image by remember(site.id, site.imageSelector) { mutableStateOf(site.imageSelector) }
@@ -1714,6 +1758,16 @@ fun SiteEditorDialog(
                 modifier = Modifier.fillMaxWidth(),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
+                Text("Site Bilgileri", fontWeight = FontWeight.Bold)
+                OutlinedTextField(
+                    name, { name = it }, modifier = Modifier.fillMaxWidth(),
+                    label = { Text("Kart adı") }, singleLine = true
+                )
+                OutlinedTextField(
+                    url, { url = it }, modifier = Modifier.fillMaxWidth(),
+                    label = { Text("Site adresi") }, singleLine = true
+                )
+
                 if (suggestions.isNotEmpty()) {
                     val s = suggestions.first()
                     Surface(
@@ -1830,7 +1884,7 @@ fun SiteEditorDialog(
             }
         },
         confirmButton = {
-            Button({ onSave(item, title, image, link, desc); onDismiss() }) {
+            Button({ onSave(name, url, item, title, image, link, desc); onDismiss() }) {
                 Text("Profili Kaydet")
             }
         },
@@ -1934,10 +1988,10 @@ fun SiteEditorDialog(
     Column(Modifier.fillMaxSize().padding(20.dp).verticalScroll(rememberScrollState())) {
         Text("Ayarlar", fontSize = 28.sp, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(16.dp))
-        Text("ScrapeFlix v0.20.0", fontWeight = FontWeight.Bold)
+        Text("ScrapeFlix v0.21.0", fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(8.dp))
         Text(
-            "v0.20: Akış linki listesindeki URL'ler artık kısaltılmadan tam metin olarak gösteriliyor.",
+            "v0.21: Çeviri artık iki bağımsız servisi sırayla deniyor (biri engelliyse diğerine düşer). Sitelerim'de bir sitenin içeriklerini İçerikler ekranından gizleyebilirsin. Profil editöründen site adı ve adresi de düzenlenebiliyor.",
             color = Color.Gray
         )
         if (vm.message.isNotBlank()) { Spacer(Modifier.height(10.dp)); Text(vm.message, color = Color.LightGray, fontSize = 12.sp) }
