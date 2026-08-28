@@ -475,6 +475,27 @@ private suspend fun downloadHls(db: AppDatabase, id: Long, folder: File, playlis
 
 data class PageAnalysis(val description: String?, val year: String?, val rating: String?, val candidates: List<StreamCandidate>)
 
+/** Bilinen reklam/analitik ağlarının host/yol kalıpları. Bu kalıplardan biri geçen bir "akış"
+ *  adayı, çoğunlukla asıl video değil bir reklam (pre-roll/VAST/VPAID) linkidir — bu yüzden
+ *  aday listesine hiç eklenmiyor. Çok kısa/genel kelimeler ("ad" gibi) kasıtlı olarak
+ *  kullanılmıyor ki normal linkler yanlışlıkla elenmesin. */
+private val adBlockKeywords = listOf(
+    "doubleclick.net", "googlesyndication", "googleadservices", "google-analytics",
+    "adservice.google", "adnxs.com", "advertising.com", "adsystem", "adserver.",
+    "/adserver/", "popads.net", "propellerads", "adsterra", "exoclick", "juicyads",
+    "trafficjunky", "mgid.com", "taboola", "outbrain", "adskeeper", "yllix",
+    "revcontent", "/vast/", "/vast.xml", "/vmap/", "prebid", "adform.net", "criteo.",
+    "media.net", "smartadserver", "pubmatic", "rubiconproject", "openx.net",
+    "adroll.com", "bidswitch", "casalemedia", "adcolony", "unityads", "vungle.com",
+    "chartboost", "applovin", "ironsrc", "adnxs-simple", "yandex.ru/ads",
+    "moatads.com", "scorecardresearch"
+)
+
+private fun isLikelyAdUrl(url: String): Boolean {
+    val lower = url.lowercase()
+    return adBlockKeywords.any { lower.contains(it) }
+}
+
 private fun guessStreamLabel(url: String, index: Int): String {
     val lower = url.lowercase()
     return when {
@@ -597,7 +618,7 @@ private fun analyzePage(pageUrl: String): PageAnalysis {
             } catch (e: Exception) { /* embed alınamadı */ }
         }
 
-        PageAnalysis(description, year, rating, candidates.distinctBy { it.url }.take(12))
+        PageAnalysis(description, year, rating, candidates.filterNot { isLikelyAdUrl(it.url) }.distinctBy { it.url }.take(12))
     } catch (e: Exception) { PageAnalysis(null, null, null, emptyList()) }
 }
 
@@ -692,7 +713,8 @@ private const val PLAY_TRIGGER_JS = """
     '[class*=player-play]','[class*=play_button]','[aria-label=Play]','[aria-label=play]',
     '[aria-label=Oynat]','[title=Play]','[title=Oynat]','[title=oynat]','[id*=play]','[class*=play]',
     '[class*=skip]','[class*=atla]','[class*=close-ad]','[class*=closead]','[class*=ad-close]',
-    '[class*=skip-ad]','video'];
+    '[class*=skip-ad]','[class*=skipad]','[class*=ytp-ad-skip]','[class*=video-ad-close]',
+    '[class*=vjs-ad-skip]','[id*=skip]','[aria-label*=Skip]','[aria-label*=Geç]','video'];
   for (var i=0;i<sels.length;i++){
     try {
       var els = document.querySelectorAll(sels[i]);
@@ -735,11 +757,16 @@ private suspend fun sniffStreamUrlsViaWebView(context: Context, pageUrl: String,
             fun addCandidate(url: String) {
                 handler.post {
                     if (resolved) return@post
+                    // Reklam (pre-roll/VAST/VPAID) linkleri aday listesine hiç eklenmiyor ve
+                    // "yerleşme" sayacını da başlatmıyor — böylece reklamın akışı yakalanıp
+                    // erkenden durulmuyor, asıl bölüm/video isteği gelene kadar dinlemeye
+                    // devam ediliyor.
+                    if (isLikelyAdUrl(url)) return@post
                     if (found.none { it.url == url }) found += StreamCandidate(guessStreamLabel(url, found.size), url)
                     if (!settleScheduled) {
                         settleScheduled = true
-                        // İlk bulgudan sonra birkaç saniye daha bekle: alternatif kaynak/kalite
-                        // seçenekleri genelde art arda kısa aralıklarla yükleniyor.
+                        // İlk gerçek bulgudan sonra birkaç saniye daha bekle: alternatif
+                        // kaynak/kalite seçenekleri genelde art arda kısa aralıklarla yükleniyor.
                         handler.postDelayed({ finish() }, 6000L)
                     }
                 }
@@ -1355,8 +1382,6 @@ enum class Page { Home, Sites, Watch, Favorites, Downloads, Settings }
             },
             bottomBar = {
                 NavigationBar(containerColor = Color.Black) {
-                    NavigationBarItem(page == Page.Home, { page = Page.Home }, icon = { Icon(Icons.Default.Home, null) }, label = { Text("Ana") })
-                    NavigationBarItem(page == Page.Sites, { page = Page.Sites }, icon = { Icon(Icons.Default.Language, null) }, label = { Text("Siteler") })
                     NavigationBarItem(page == Page.Watch, { page = Page.Watch }, icon = { Icon(Icons.Default.PlayArrow, null) }, label = { Text("İçerikler") })
                     NavigationBarItem(page == Page.Favorites, { page = Page.Favorites }, icon = { Icon(Icons.Default.Favorite, null) }, label = { Text("Beğenilen") })
                     NavigationBarItem(page == Page.Downloads, { page = Page.Downloads }, icon = { Icon(Icons.Default.Download, null) }, label = { Text("İndirilenler") })
@@ -1371,7 +1396,7 @@ enum class Page { Home, Sites, Watch, Favorites, Downloads, Settings }
                     Page.Watch -> WatchScreen(vm)
                     Page.Favorites -> FavoritesScreen(vm)
                     Page.Downloads -> DownloadsScreen(vm)
-                    Page.Settings -> SettingsScreen(vm)
+                    Page.Settings -> SettingsScreen(vm) { p -> page = p }
                 }
             }
         }
@@ -1972,7 +1997,7 @@ fun SiteEditorDialog(
     }
 }
 
-@Composable fun SettingsScreen(vm: ScrapeViewModel = viewModel(factory = VmFactory(LocalContext.current))) {
+@Composable fun SettingsScreen(vm: ScrapeViewModel = viewModel(factory = VmFactory(LocalContext.current)), onNavigate: (Page) -> Unit = {}) {
     val context = LocalContext.current
     var lockActive by remember { mutableStateOf(LockPrefs.isLockActive(context)) }
     var showSetup by remember { mutableStateOf(false) }
@@ -1988,10 +2013,27 @@ fun SiteEditorDialog(
     Column(Modifier.fillMaxSize().padding(20.dp).verticalScroll(rememberScrollState())) {
         Text("Ayarlar", fontSize = 28.sp, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(16.dp))
-        Text("ScrapeFlix v0.21.0", fontWeight = FontWeight.Bold)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Default.Home, null, tint = Color(0xFFE50914))
+            Spacer(Modifier.width(8.dp))
+            Text("Gezinme", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+        }
+        Spacer(Modifier.height(12.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton({ onNavigate(Page.Home) }) {
+                Icon(Icons.Default.Home, null); Spacer(Modifier.width(6.dp)); Text("Ana Sayfa")
+            }
+            OutlinedButton({ onNavigate(Page.Sites) }) {
+                Icon(Icons.Default.Language, null); Spacer(Modifier.width(6.dp)); Text("Sitelerim")
+            }
+        }
+        Spacer(Modifier.height(28.dp))
+        HorizontalDivider(color = Color(0xFF2A2A2A))
+        Spacer(Modifier.height(20.dp))
+        Text("ScrapeFlix v0.22.0", fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(8.dp))
         Text(
-            "v0.21: Çeviri artık iki bağımsız servisi sırayla deniyor (biri engelliyse diğerine düşer). Sitelerim'de bir sitenin içeriklerini İçerikler ekranından gizleyebilirsin. Profil editöründen site adı ve adresi de düzenlenebiliyor.",
+            "v0.22: Akış aramada reklam linkleri artık atlanıp asıl video/bölüm bekleniyor. Ana Sayfa ve Sitelerim, alt menüden kaldırılıp buraya (Ayarlar) taşındı.",
             color = Color.Gray
         )
         if (vm.message.isNotBlank()) { Spacer(Modifier.height(10.dp)); Text(vm.message, color = Color.LightGray, fontSize = 12.sp) }
