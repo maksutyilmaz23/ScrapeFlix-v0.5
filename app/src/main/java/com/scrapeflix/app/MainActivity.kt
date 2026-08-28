@@ -32,6 +32,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -1365,11 +1366,11 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
 }
 
 class VmFactory(private val context: Context): ViewModelProvider.Factory { override fun <T:ViewModel> create(c:Class<T>):T { @Suppress("UNCHECKED_CAST") return ScrapeViewModel(AppDatabase.get(context)) as T } }
-enum class Page { Home, Sites, Watch, Favorites, Downloads, Settings }
+enum class Page { Sites, Watch, Favorites, Downloads, Settings }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable fun App(vm:ScrapeViewModel=viewModel(factory=VmFactory(LocalContext.current))) {
-    var page by remember{mutableStateOf(Page.Home)}; var add by remember{mutableStateOf(false)}; var editor by remember{mutableStateOf<SiteEntity?>(null)}; var preview by remember{mutableStateOf(false)}
+    var page by rememberSaveable{mutableStateOf(Page.Sites)}; var add by remember{mutableStateOf(false)}; var editor by remember{mutableStateOf<SiteEntity?>(null)}; var preview by remember{mutableStateOf(false)}
     MaterialTheme(colorScheme=darkColorScheme(background=Color(0xFF080808),surface=Color(0xFF151515),primary=Color(0xFFE50914))) {
         Scaffold(
             containerColor = Color(0xFF080808),
@@ -1391,7 +1392,6 @@ enum class Page { Home, Sites, Watch, Favorites, Downloads, Settings }
         ) { pad ->
             Box(Modifier.padding(pad).fillMaxSize()) {
                 when (page) {
-                    Page.Home -> HomeScreen(vm) { page = Page.Sites }
                     Page.Sites -> SitesScreen(vm, { add = true }, { editor = it }) { s -> vm.setWatchFilter(s.id); page = Page.Watch }
                     Page.Watch -> WatchScreen(vm)
                     Page.Favorites -> FavoritesScreen(vm)
@@ -1417,8 +1417,6 @@ enum class Page { Home, Sites, Watch, Favorites, Downloads, Settings }
         GlobalDialogs(vm, LocalContext.current)
     }
 }
-
-@Composable fun HomeScreen(vm:ScrapeViewModel,open:()->Unit){val sites by vm.sites.collectAsState();val all by vm.allItems.collectAsState();LazyColumn(Modifier.fillMaxSize().padding(16.dp),verticalArrangement=Arrangement.spacedBy(14.dp)){item{Text("Ana Sayfa",fontSize=28.sp,fontWeight=FontWeight.Bold);Text("${sites.size} site • ${all.size} içerik",color=Color.Gray)};item{Button(open,Modifier.fillMaxWidth()){Icon(Icons.Default.Language,null);Spacer(Modifier.width(8.dp));Text("Sitelerimi Yönet")}};items(sites){s->SiteCard(s,{vm.analyze(s)},{vm.scrape(s)},{vm.deleteSite(s)})}}}
 
 @Composable fun SitesScreen(vm:ScrapeViewModel,onAdd:()->Unit,onEdit:(SiteEntity)->Unit,onOpenContent:(SiteEntity)->Unit){val sites by vm.sites.collectAsState();Column(Modifier.fillMaxSize().padding(16.dp)){Row(Modifier.fillMaxWidth(),Arrangement.SpaceBetween,Alignment.CenterVertically){Column{Text("Sitelerim",fontSize=26.sp,fontWeight=FontWeight.Bold);Text("Analiz • önizleme • profil",color=Color.Gray)};FilledTonalButton(onAdd){Icon(Icons.Default.Add,null);Text(" Ekle")}};Spacer(Modifier.height(14.dp));if(vm.busy)LinearProgressIndicator(Modifier.fillMaxWidth());if(vm.message.isNotBlank())Text(vm.message,color=Color.LightGray,modifier=Modifier.padding(vertical=8.dp));LazyColumn(verticalArrangement=Arrangement.spacedBy(10.dp)){items(sites){s->SiteCard(s,{vm.analyze(s)},{vm.scrape(s)},{vm.deleteSite(s)},{vm.toggleSiteHidden(s)},{onOpenContent(s)});TextButton({onEdit(s)}){Icon(Icons.Default.Edit,null);Text(" Profil / Önizleme")}}}}}
 
@@ -2014,26 +2012,21 @@ fun SiteEditorDialog(
         Text("Ayarlar", fontSize = 28.sp, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(16.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Icon(Icons.Default.Home, null, tint = Color(0xFFE50914))
+            Icon(Icons.Default.Language, null, tint = Color(0xFFE50914))
             Spacer(Modifier.width(8.dp))
             Text("Gezinme", fontWeight = FontWeight.Bold, fontSize = 16.sp)
         }
         Spacer(Modifier.height(12.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton({ onNavigate(Page.Home) }) {
-                Icon(Icons.Default.Home, null); Spacer(Modifier.width(6.dp)); Text("Ana Sayfa")
-            }
-            OutlinedButton({ onNavigate(Page.Sites) }) {
-                Icon(Icons.Default.Language, null); Spacer(Modifier.width(6.dp)); Text("Sitelerim")
-            }
+        OutlinedButton({ onNavigate(Page.Sites) }) {
+            Icon(Icons.Default.Language, null); Spacer(Modifier.width(6.dp)); Text("Sitelerim")
         }
         Spacer(Modifier.height(28.dp))
         HorizontalDivider(color = Color(0xFF2A2A2A))
         Spacer(Modifier.height(20.dp))
-        Text("ScrapeFlix v0.22.0", fontWeight = FontWeight.Bold)
+        Text("ScrapeFlix v0.23.0", fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(8.dp))
         Text(
-            "v0.22: Akış aramada reklam linkleri artık atlanıp asıl video/bölüm bekleniyor. Ana Sayfa ve Sitelerim, alt menüden kaldırılıp buraya (Ayarlar) taşındı.",
+            "v0.23: Ekran döndürüldüğünde artık bulunduğun menüde kalıyorsun (eskiden Ana Sayfa'ya sıçrıyordu). Ana Sayfa menüsü kaldırıldı — Sitelerim ile aynı işi gördüğü için birleştirildi.",
             color = Color.Gray
         )
         if (vm.message.isNotBlank()) { Spacer(Modifier.height(10.dp)); Text(vm.message, color = Color.LightGray, fontSize = 12.sp) }
