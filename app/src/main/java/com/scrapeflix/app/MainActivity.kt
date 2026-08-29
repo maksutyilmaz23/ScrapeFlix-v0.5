@@ -807,7 +807,7 @@ private const val PLAY_TRIGGER_JS = """
  * imzasına bakar. İlk aday bulunduktan sonra birkaç saniye daha dinlemeye devam eder ki
  * varsa alternatif sunucu/kalite linkleri de yakalansın (hepsi kullanıcıya listelenecek).
  */
-private suspend fun sniffStreamUrlsViaWebView(context: Context, pageUrl: String, timeoutMs: Long = 34000L): List<StreamCandidate> =
+private suspend fun sniffSinglePage(context: Context, pageUrl: String, timeoutMs: Long = 34000L): List<StreamCandidate> =
     withContext(Dispatchers.Main) {
         suspendCancellableCoroutine { cont ->
             var resolved = false
@@ -902,6 +902,35 @@ private suspend fun sniffStreamUrlsViaWebView(context: Context, pageUrl: String,
         }
     }
 
+/** Bir sayfadaki iframe'lerin (reklam olmayan) adreslerini statik olarak çıkarır. */
+private fun extractIframeUrls(pageUrl: String): List<String> {
+    return try {
+        val doc = Jsoup.connect(pageUrl).userAgent("Mozilla/5.0 (Android) ScrapeFlix/0.25").timeout(12000).followRedirects(true).get()
+        doc.select("iframe[src]")
+            .mapNotNull { it.absUrl("src").takeUnless { u -> u.isBlank() } }
+            .filterNot { isLikelyAdUrl(it) }
+            .distinct()
+    } catch (e: Exception) { emptyList() }
+}
+
+/**
+ * sniffSinglePage'i ana sayfa üzerinde dener; sonuç boş çıkarsa (bazı sitelerde player
+ * cross-origin bir iframe içinde olup üst çerçeveden tıklama simülasyonuyla erişilemiyor —
+ * tarayıcı güvenlik kısıtı, aşılamaz), sayfadaki iframe adreslerini bulup HER BİRİNİ
+ * kendi başına bir sayfa gibi (üst düzey doküman olarak) yeniden dener. Bu sayede iframe'in
+ * kendi play butonuna da JS ile tıklanabiliyor — çünkü artık cross-origin değil, doğrudan
+ * o adres yükleniyor.
+ */
+private suspend fun sniffStreamUrlsViaWebView(context: Context, pageUrl: String, timeoutMs: Long = 34000L): List<StreamCandidate> {
+    val direct = sniffSinglePage(context, pageUrl, timeoutMs)
+    if (direct.isNotEmpty()) return direct
+    val iframeUrls = withContext(Dispatchers.IO) { extractIframeUrls(pageUrl) }
+    for (iframeUrl in iframeUrls.take(2)) {
+        val result = sniffSinglePage(context, iframeUrl, 16000L)
+        if (result.isNotEmpty()) return result
+    }
+    return emptyList()
+}
 
 data class EpisodeInfo(val title: String, val url: String)
 
@@ -1270,6 +1299,19 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
             if (candidates.isNotEmpty()) {
                 message = "Dosya boyutları kontrol ediliyor..."
                 candidates = withContext(Dispatchers.IO) { enrichCandidatesWithSize(candidates) }
+                    // Büyükten küçüğe sırala: asıl video genelde en büyük dosyadır, reklam/altyazı
+                    // gibi küçük dosyalar en sona düşer. HLS (m3u8) akışlarının segment yapısı
+                    // yüzünden tek bir boyutu ölçülemez ama neredeyse hep asıl içeriktir (reklamlar
+                    // HLS olarak değil kısa direkt dosyalar olarak servis edilir) — bu yüzden
+                    // boyutu bilinmeyenler arasında en üstte tutuluyor, sadece "boyutu bulunamadı"
+                    // olan direkt dosyalar en sona düşüyor.
+                    .sortedByDescending { c ->
+                        when {
+                            c.extension?.lowercase(Locale.getDefault()) == "m3u8" -> Long.MAX_VALUE
+                            c.sizeBytes != null -> c.sizeBytes
+                            else -> -1L
+                        }
+                    }
             }
             streamBusy = false
             streamCandidates = candidates
@@ -2114,10 +2156,10 @@ fun SiteEditorDialog(
         Spacer(Modifier.height(28.dp))
         HorizontalDivider(color = Color(0xFF2A2A2A))
         Spacer(Modifier.height(20.dp))
-        Text("ScrapeFlix v0.24.0", fontWeight = FontWeight.Bold)
+        Text("ScrapeFlix v0.25.0", fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(8.dp))
         Text(
-            "v0.24: Uygulama artık İçerikler ekranıyla açılıyor. Akış aramada ses dosyaları da reklamlar gibi elenip yalnızca video adayları gösteriliyor. Her akış linkinin yanında dosya uzantısı ve boyutu (MB/KB) görünüyor.",
+            "v0.25: Akış linkleri artık dosya boyutuna göre büyükten küçüğe sıralanıyor (asıl video genelde en üstte). Ana sayfada hiçbir şey bulunamazsa, sayfadaki iframe'ler kendi başlarına yeniden denenerek player'a cross-origin engelini aşarak ulaşılmaya çalışılıyor.",
             color = Color.Gray
         )
         if (vm.message.isNotBlank()) { Spacer(Modifier.height(10.dp)); Text(vm.message, color = Color.LightGray, fontSize = 12.sp) }
