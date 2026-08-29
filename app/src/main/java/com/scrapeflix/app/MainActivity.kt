@@ -302,7 +302,7 @@ private fun refererFor(url: String): String = try {
 
 private val streamUrlRegex = Regex("""https?://[^\s"'<>\\]+\.(m3u8|mp4|mpd)(\?[^\s"'<>\\]*)?""", RegexOption.IGNORE_CASE)
 
-data class StreamCandidate(val label: String, val url: String)
+data class StreamCandidate(val label: String, val url: String, val sizeBytes: Long? = null, val extension: String? = null)
 
 /** İndirilen içeriği (HLS'te birden çok segment dosyası dahil) cihaz dışına açmadan,
  *  uygulama içi bir loopback (127.0.0.1) HTTP sunucusu üzerinden dış oynatıcıya sunar.
@@ -497,6 +497,79 @@ private fun isLikelyAdUrl(url: String): Boolean {
     return adBlockKeywords.any { lower.contains(it) }
 }
 
+/** Sadece ses içeren dosya uzantıları — uygulamanın amacı video sunmak olduğu için bunlar
+ *  akış adayı olarak hiç gösterilmiyor (reklam/arkaplan müziği/altyazı sesi olabilirler). */
+private val audioOnlyExtensions = setOf("mp3", "aac", "wav", "m4a", "ogg", "oga", "flac", "wma", "opus", "weba")
+
+private fun isAudioOnlyUrl(url: String): Boolean {
+    val ext = url.substringBefore('?').substringAfterLast('.', "").lowercase(Locale.getDefault())
+    return ext in audioOnlyExtensions
+}
+
+/** Bir adayı listeye eklemeye değer mi: reklam ağı değil VE salt ses dosyası değil. */
+private fun isEligibleStreamCandidate(url: String): Boolean = !isLikelyAdUrl(url) && !isAudioOnlyUrl(url)
+
+/** Bir URL'in dosya boyutunu (byte) ve uzantısını, dosyayı indirmeden öğrenmeye çalışır.
+ *  Önce HEAD isteği dener; sunucu HEAD'i desteklemiyorsa/Content-Length vermiyorsa 1 byte'lık
+ *  bir Range isteğiyle "Content-Range" başlığından toplam boyutu çıkarır. */
+private fun probeUrl(url: String): Pair<Long?, String?> {
+    val ext = url.substringBefore('?').substringAfterLast('.', "")
+        .takeIf { it.length in 1..5 && it.all { c -> c.isLetterOrDigit() } }
+    var size: Long? = null
+    try {
+        val conn = (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply {
+            requestMethod = "HEAD"; instanceFollowRedirects = true
+            connectTimeout = 6000; readTimeout = 6000
+            setRequestProperty("User-Agent", "Mozilla/5.0 (Android) ScrapeFlix/0.24")
+            setRequestProperty("Referer", refererFor(url))
+        }
+        if (conn.responseCode in 200..299) size = conn.contentLengthLong.takeIf { it > 0 }
+        conn.disconnect()
+    } catch (e: Exception) { /* HEAD desteklenmiyor olabilir, Range ile devam et */ }
+    if (size == null) {
+        try {
+            val conn = (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply {
+                instanceFollowRedirects = true
+                connectTimeout = 6000; readTimeout = 6000
+                setRequestProperty("User-Agent", "Mozilla/5.0 (Android) ScrapeFlix/0.24")
+                setRequestProperty("Referer", refererFor(url))
+                setRequestProperty("Range", "bytes=0-0")
+            }
+            if (conn.responseCode in 200..299) {
+                size = conn.getHeaderField("Content-Range")?.substringAfter('/')?.toLongOrNull()
+                    ?: conn.contentLengthLong.takeIf { it > 1 }
+            }
+            conn.disconnect()
+        } catch (e: Exception) { /* boyut alınamadı, sorun değil */ }
+    }
+    return size to ext
+}
+
+private fun formatFileSize(bytes: Long?): String? {
+    if (bytes == null || bytes <= 0) return null
+    val mb = bytes / (1024.0 * 1024.0)
+    return if (mb < 1) "%.0f KB".format(bytes / 1024.0) else "%.1f MB".format(mb)
+}
+
+/** Aday listesindeki her linkin boyutunu/uzantısını paralel olarak sorgular (m3u8 playlist'leri
+ *  hariç — onların "boyutu" tek bir dosya değil, segmentlere yayılı olduğu için anlamsız). */
+private suspend fun enrichCandidatesWithSize(list: List<StreamCandidate>): List<StreamCandidate> = coroutineScope {
+    val semaphore = Semaphore(4)
+    list.map { c ->
+        async(Dispatchers.IO) {
+            val isPlaylist = c.url.substringBefore('?').lowercase(Locale.getDefault()).let { it.endsWith(".m3u8") || it.contains("/hls/") }
+            if (isPlaylist) {
+                c.copy(extension = "m3u8")
+            } else {
+                semaphore.withPermit {
+                    val (size, ext) = probeUrl(c.url)
+                    c.copy(sizeBytes = size, extension = ext ?: c.extension)
+                }
+            }
+        }
+    }.awaitAll()
+}
+
 private fun guessStreamLabel(url: String, index: Int): String {
     val lower = url.lowercase()
     return when {
@@ -619,7 +692,7 @@ private fun analyzePage(pageUrl: String): PageAnalysis {
             } catch (e: Exception) { /* embed alınamadı */ }
         }
 
-        PageAnalysis(description, year, rating, candidates.filterNot { isLikelyAdUrl(it.url) }.distinctBy { it.url }.take(12))
+        PageAnalysis(description, year, rating, candidates.filter { isEligibleStreamCandidate(it.url) }.distinctBy { it.url }.take(12))
     } catch (e: Exception) { PageAnalysis(null, null, null, emptyList()) }
 }
 
@@ -758,11 +831,11 @@ private suspend fun sniffStreamUrlsViaWebView(context: Context, pageUrl: String,
             fun addCandidate(url: String) {
                 handler.post {
                     if (resolved) return@post
-                    // Reklam (pre-roll/VAST/VPAID) linkleri aday listesine hiç eklenmiyor ve
-                    // "yerleşme" sayacını da başlatmıyor — böylece reklamın akışı yakalanıp
-                    // erkenden durulmuyor, asıl bölüm/video isteği gelene kadar dinlemeye
-                    // devam ediliyor.
-                    if (isLikelyAdUrl(url)) return@post
+                    // Reklam (pre-roll/VAST/VPAID) ve salt ses dosyası linkleri aday listesine
+                    // hiç eklenmiyor ve "yerleşme" sayacını da başlatmıyor — böylece bunlar
+                    // yakalanıp erkenden durulmuyor, asıl bölüm/video isteği gelene kadar
+                    // dinlemeye devam ediliyor.
+                    if (!isEligibleStreamCandidate(url)) return@post
                     if (found.none { it.url == url }) found += StreamCandidate(guessStreamLabel(url, found.size), url)
                     if (!settleScheduled) {
                         settleScheduled = true
@@ -1194,6 +1267,10 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
                 message = "Sayfa açılıp oynatma/reklam geçme tetikleniyor (biraz sürebilir): $title"
                 candidates = sniffStreamUrlsViaWebView(context, url)
             }
+            if (candidates.isNotEmpty()) {
+                message = "Dosya boyutları kontrol ediliyor..."
+                candidates = withContext(Dispatchers.IO) { enrichCandidatesWithSize(candidates) }
+            }
             streamBusy = false
             streamCandidates = candidates
             message = if (candidates.isEmpty()) "Akış linki bulunamadı: $title" else ""
@@ -1370,7 +1447,7 @@ enum class Page { Sites, Watch, Favorites, Downloads, Settings }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable fun App(vm:ScrapeViewModel=viewModel(factory=VmFactory(LocalContext.current))) {
-    var page by rememberSaveable{mutableStateOf(Page.Sites)}; var add by remember{mutableStateOf(false)}; var editor by remember{mutableStateOf<SiteEntity?>(null)}; var preview by remember{mutableStateOf(false)}
+    var page by rememberSaveable{mutableStateOf(Page.Watch)}; var add by remember{mutableStateOf(false)}; var editor by remember{mutableStateOf<SiteEntity?>(null)}; var preview by remember{mutableStateOf(false)}
     MaterialTheme(colorScheme=darkColorScheme(background=Color(0xFF080808),surface=Color(0xFF151515),primary=Color(0xFFE50914))) {
         Scaffold(
             containerColor = Color(0xFF080808),
@@ -1573,7 +1650,21 @@ fun GlobalDialogs(vm: ScrapeViewModel, context: Context) {
                                     Icon(Icons.Default.PlayArrow, null, tint = Color(0xFFE50914))
                                     Spacer(Modifier.width(8.dp))
                                     Column(Modifier.weight(1f)) {
-                                        Text(c.label, fontWeight = FontWeight.Medium)
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Text(c.label, fontWeight = FontWeight.Medium)
+                                            val sizeText = formatFileSize(c.sizeBytes)
+                                            val extText = c.extension?.uppercase(Locale.getDefault())
+                                            if (!extText.isNullOrBlank()) {
+                                                Spacer(Modifier.width(6.dp))
+                                                Surface(shape = RoundedCornerShape(4.dp), color = Color(0xFF2A2A2A)) {
+                                                    Text(extText, color = Color(0xFFD4AF37), fontSize = 10.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp))
+                                                }
+                                            }
+                                            if (!sizeText.isNullOrBlank()) {
+                                                Spacer(Modifier.width(6.dp))
+                                                Text(sizeText, color = Color(0xFF4CAF50), fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                                            }
+                                        }
                                         Text(c.url, color = Color.Gray, fontSize = 11.sp, softWrap = true)
                                     }
                                     IconButton({ vm.startDownload(context, "$title — ${c.label}", c.url) }) {
@@ -2023,10 +2114,10 @@ fun SiteEditorDialog(
         Spacer(Modifier.height(28.dp))
         HorizontalDivider(color = Color(0xFF2A2A2A))
         Spacer(Modifier.height(20.dp))
-        Text("ScrapeFlix v0.23.0", fontWeight = FontWeight.Bold)
+        Text("ScrapeFlix v0.24.0", fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(8.dp))
         Text(
-            "v0.23: Ekran döndürüldüğünde artık bulunduğun menüde kalıyorsun (eskiden Ana Sayfa'ya sıçrıyordu). Ana Sayfa menüsü kaldırıldı — Sitelerim ile aynı işi gördüğü için birleştirildi.",
+            "v0.24: Uygulama artık İçerikler ekranıyla açılıyor. Akış aramada ses dosyaları da reklamlar gibi elenip yalnızca video adayları gösteriliyor. Her akış linkinin yanında dosya uzantısı ve boyutu (MB/KB) görünüyor.",
             color = Color.Gray
         )
         if (vm.message.isNotBlank()) { Spacer(Modifier.height(10.dp)); Text(vm.message, color = Color.LightGray, fontSize = 12.sp) }
