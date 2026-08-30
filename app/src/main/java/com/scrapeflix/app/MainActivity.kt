@@ -265,8 +265,14 @@ private fun extractItems(doc: Document, site: SiteEntity, categoryLabel: String)
  *  Bu fonksiyon sadece zaten akış linki olarak DOĞRULANMIŞ URL'lerle çağrılır (resolveStreamUrl /
  *  sniffStreamUrlViaWebView tarafından bulunmuş), bu yüzden uzantı belirsiz/gizlenmiş olsa bile
  *  (ör. ".txt" ile maskelenmiş m3u8) MIME tipi her zaman video/akış olarak zorlanır — aksi halde
- *  Android bu isteği sadece tarayıcılara yönlendirir ve video oynatıcı uygulamalar hiç çıkmaz. */
-private fun openContent(context: Context, url: String) {
+ *  Android bu isteği sadece tarayıcılara yönlendirir ve video oynatıcı uygulamalar hiç çıkmaz.
+ *
+ *  referer/userAgent verilirse, MX Player/ExoPlayer tabanlı oynatıcıların tanıdığı standart
+ *  "android.media.intent.extra.HTTP_HEADERS" Bundle'ı ve daha eski oynatıcıların beklediği
+ *  düz "headers" string dizisi olarak İKİ FORMATTA da Intent'e ekleniyor (geniş uyumluluk için).
+ *  Bu olmadan birçok site, oynatıcının isteğinde kendi sayfasının Referer'ı yoksa bağlantıyı
+ *  reddedip "hata" veya boş ekran gösterebiliyor — akış linki doğru bulunsa bile. */
+private fun openContent(context: Context, url: String, referer: String? = null, userAgent: String? = null) {
     val cleanUrl = url.substringBefore('?')
     val ext = cleanUrl.substringAfterLast('.', "").lowercase()
     val mimeType = when (ext) {
@@ -274,22 +280,29 @@ private fun openContent(context: Context, url: String) {
         "mpd" -> "application/dash+xml"
         else -> "video/*"
     }
-    val viewIntent = Intent(Intent.ACTION_VIEW).apply {
+    val ua = userAgent ?: "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
+
+    fun buildIntent() = Intent(Intent.ACTION_VIEW).apply {
         setDataAndType(Uri.parse(url), mimeType)
+        // MX Player / ExoPlayer tabanlı oynatıcıların tanıdığı resmi format.
+        putExtra("android.media.intent.extra.HTTP_HEADERS", android.os.Bundle().apply {
+            putString("User-Agent", ua)
+            if (!referer.isNullOrBlank()) putString("Referer", referer)
+        })
+        // Bazı oynatıcılar (MX Player dahil, eski sürümler) düz string dizisi de kabul ediyor.
+        val headerPairs = mutableListOf("User-Agent", ua)
+        if (!referer.isNullOrBlank()) { headerPairs.add("Referer"); headerPairs.add(referer) }
+        putExtra("headers", headerPairs.toTypedArray())
     }
-    val chooser = Intent.createChooser(viewIntent, "Hangi uygulamada oynatılsın?").apply {
+
+    val chooser = Intent.createChooser(buildIntent(), "Hangi uygulamada oynatılsın?").apply {
         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     }
     try {
         context.startActivity(chooser)
     } catch (e: Exception) {
         try {
-            context.startActivity(
-                Intent(Intent.ACTION_VIEW).apply {
-                    setDataAndType(Uri.parse(url), mimeType)
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                }
-            )
+            context.startActivity(buildIntent().apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) })
         } catch (e2: Exception) { /* açılacak uygulama yok */ }
     }
 }
@@ -1164,6 +1177,7 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
     fun closeDetail() { detailItem = null; detailInfo = null }
     var streamCandidates by mutableStateOf<List<StreamCandidate>>(emptyList()); private set
     var streamCandidatesTitle by mutableStateOf<String?>(null); private set
+    private var streamSourcePageUrl: String? = null
     fun closeStreamPicker() { streamCandidates = emptyList(); streamCandidatesTitle = null }
     var episodes by mutableStateOf<List<EpisodeInfo>>(emptyList()); private set
     var episodesBusy by mutableStateOf(false); private set
@@ -1287,7 +1301,7 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
      *  yöntemle sayfayı gizli bir WebView'de çalıştırıp ağ isteklerini dinleyerek arar. */
     fun findStreams(context: Context, title: String, url: String) {
         if (streamBusy) return
-        streamBusy = true; streamCandidatesTitle = title; streamCandidates = emptyList()
+        streamBusy = true; streamCandidatesTitle = title; streamCandidates = emptyList(); streamSourcePageUrl = url
         message = "Akış linkleri aranıyor: $title"
         viewModelScope.launch {
             val analysis = withContext(Dispatchers.IO) { analyzePage(url) }
@@ -1320,7 +1334,11 @@ class ScrapeViewModel(private val db: AppDatabase) : ViewModel() {
     }
 
     fun pickStream(context: Context, url: String) {
-        openContent(context, url)
+        // Video sunucuları çoğunlukla isteğin, akışın bulunduğu sayfayla aynı siteden geldiğini
+        // doğrulamak için Referer header'ı kontrol ediyor — bu yüzden oynatıcıya, akışın
+        // bulunduğu orijinal sayfanın adresini Referer olarak iletiyoruz.
+        val referer = streamSourcePageUrl?.let { refererFor(it) } ?: refererFor(url)
+        openContent(context, url, referer = referer)
         closeStreamPicker()
     }
 
@@ -2156,10 +2174,10 @@ fun SiteEditorDialog(
         Spacer(Modifier.height(28.dp))
         HorizontalDivider(color = Color(0xFF2A2A2A))
         Spacer(Modifier.height(20.dp))
-        Text("ScrapeFlix v0.25.0", fontWeight = FontWeight.Bold)
+        Text("ScrapeFlix v0.26.0", fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(8.dp))
         Text(
-            "v0.25: Akış linkleri artık dosya boyutuna göre büyükten küçüğe sıralanıyor (asıl video genelde en üstte). Ana sayfada hiçbir şey bulunamazsa, sayfadaki iframe'ler kendi başlarına yeniden denenerek player'a cross-origin engelini aşarak ulaşılmaya çalışılıyor.",
+            "v0.26: Bir akış linki seçilip oynatıcıya gönderildiğinde artık Referer ve User-Agent bilgileri de (MX Player/ExoPlayer'ın tanıdığı standart formatta) birlikte iletiliyor — böylece sunucu isteği reddetmiyor, link doğru bulunduğunda oynatıcıda daha güvenilir açılıyor.",
             color = Color.Gray
         )
         if (vm.message.isNotBlank()) { Spacer(Modifier.height(10.dp)); Text(vm.message, color = Color.LightGray, fontSize = 12.sp) }
